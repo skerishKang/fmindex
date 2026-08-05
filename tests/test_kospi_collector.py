@@ -885,42 +885,56 @@ class TestMarketBridgeReal:
 
 
 class TestTicScopeCanonicalContract:
-    """Canonical tic_scope contract: int everywhere, fail-fast on invalid."""
+    """Canonical tic_scope contract: string wire type, fail-fast on invalid."""
 
-    def test_default_value_is_int(self):
+    def test_default_value_is_string(self):
         cfg = CollectorConfig(from_date="2026-08-05", to_date="2026-08-05")
-        assert cfg.tic_scope == 60
-        assert type(cfg.tic_scope) is int
+        assert cfg.tic_scope == "60"
+        assert type(cfg.tic_scope) is str
 
-    def test_numeric_input_is_int(self):
-        cfg = CollectorConfig(from_date="2026-08-05", to_date="2026-08-05", tic_scope=60)
-        assert cfg.tic_scope == 60
-        assert type(cfg.tic_scope) is int
-
-    def test_compatible_string_input_canonicalized_to_int(self):
+    def test_string_input_stays_string(self):
         cfg = CollectorConfig(from_date="2026-08-05", to_date="2026-08-05", tic_scope="60")
-        assert cfg.tic_scope == 60
-        assert type(cfg.tic_scope) is int
+        assert cfg.tic_scope == "60"
+        assert type(cfg.tic_scope) is str
 
-    def test_all_allowed_scopes_are_int(self):
+    def test_int_compatible_input_canonicalized_to_string(self):
+        cfg = CollectorConfig(from_date="2026-08-05", to_date="2026-08-05", tic_scope=60)
+        assert cfg.tic_scope == "60"
+        assert type(cfg.tic_scope) is str
+
+    def test_all_allowed_scopes_are_strings(self):
         from fmindex.market.kospi_collector import ALLOWED_TIC_SCOPES
         for scope in ALLOWED_TIC_SCOPES:
             cfg = CollectorConfig(
                 from_date="2026-08-05", to_date="2026-08-05", tic_scope=scope
             )
-            assert type(cfg.tic_scope) is int
+            assert type(cfg.tic_scope) is str
             assert cfg.tic_scope == scope
+
+    def test_int_counterparts_canonicalize_to_string(self):
+        for wire, as_int in [
+            ("1", 1), ("3", 3), ("5", 5), ("10", 10),
+            ("15", 15), ("30", 30), ("45", 45), ("60", 60),
+        ]:
+            cfg = CollectorConfig(
+                from_date="2026-08-05", to_date="2026-08-05", tic_scope=as_int
+            )
+            assert cfg.tic_scope == wire
+            assert type(cfg.tic_scope) is str
 
     @pytest.mark.parametrize(
         "bad",
-        [0, 2, 59, 90, "abc", "05", None, True, False, 60.0, "60.0"],
+        [
+            "0", "2", "59", "90", "05", "060", " 60", "60 ", "abc", "60.0",
+            0, 2, 59, 90, 60.0, None, True, False, [60], {"value": 60},
+        ],
     )
     def test_invalid_scope_fails_fast(self, bad):
         with pytest.raises(ValueError):
             CollectorConfig(from_date="2026-08-05", to_date="2026-08-05", tic_scope=bad)
 
-    def test_request_body_tic_scope_is_int(self, tmp_path):
-        """The body seen by the transport must carry int tic_scope."""
+    def test_request_body_tic_scope_is_string(self, tmp_path):
+        """The body seen by the transport must carry a string tic_scope."""
         seen = {}
 
         def transport(url, body, headers):
@@ -940,10 +954,10 @@ class TestTicScopeCanonicalContract:
         fresh = collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
         assert fresh is not None
         assert "tic_scope" in seen["body"]
-        assert seen["body"]["tic_scope"] == 60
-        assert type(seen["body"]["tic_scope"]) is int
+        assert seen["body"]["tic_scope"] == "60"
+        assert type(seen["body"]["tic_scope"]) is str
 
-    def test_all_allowed_scopes_sent_as_int(self, tmp_path):
+    def test_all_allowed_scopes_sent_as_string(self, tmp_path):
         from fmindex.market.kospi_collector import ALLOWED_TIC_SCOPES
         for scope in ALLOWED_TIC_SCOPES:
             seen = {}
@@ -963,16 +977,16 @@ class TestTicScopeCanonicalContract:
             )
             collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
             collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
-            assert type(seen["body"]["tic_scope"]) is int
+            assert type(seen["body"]["tic_scope"]) is str
             assert seen["body"]["tic_scope"] == scope
 
-    def test_live_error_mock_rejects_string_tic_scope(self, tmp_path):
-        """Reproduce the live API failure: a string tic_scope must fail."""
+    def test_live_contract_mock_string_succeeds_int_fails(self, tmp_path):
+        """Mock the live API: str tic_scope succeeds, int tic_scope is rejected."""
         seen = {}
 
         def strict_transport(url, body, headers):
             seen["body"] = body
-            if type(body.get("tic_scope")) is not int:
+            if type(body.get("tic_scope")) is not str:
                 raise KiwoomAPIError(
                     "Kiwoom API error [ka20005] return_code=2: "
                     "파라미터=tic_scope 실패사유= 타입 불일치"
@@ -984,17 +998,37 @@ class TestTicScopeCanonicalContract:
         cfg = CollectorConfig(
             from_date="2026-08-05",
             to_date="2026-08-05",
-            tic_scope="60",  # string input canonicalized to int
+            tic_scope="60",
             output=str(tmp_path / "out.jsonl"),
             metadata_output=str(tmp_path / "out.meta.json"),
         )
-        assert type(cfg.tic_scope) is int
+        assert type(cfg.tic_scope) is str
         collector = KospiCollector(client=make_client(transport=strict_transport), config=cfg, request_delay=0.0)
         collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
-        assert type(seen["body"]["tic_scope"]) is int
+        assert type(seen["body"]["tic_scope"]) is str
 
-    def test_body_serialization_is_number(self, tmp_path):
-        """json.dumps of the request body must emit tic_scope as a number."""
+    def test_int_wire_regression_guard(self, tmp_path):
+        """An int tic_scope in the request body must be rejected by the mock."""
+        seen = {}
+
+        def transport(url, body, headers):
+            seen["body"] = body
+            return make_minute_page([], cont_yn="N")
+
+        cfg = CollectorConfig(
+            from_date="2026-08-05",
+            to_date="2026-08-05",
+            tic_scope=60,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
+        collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
+        # Explicit guard: the production request body must NEVER carry int.
+        assert type(seen["body"]["tic_scope"]) is not int
+
+    def test_body_serialization_is_string(self, tmp_path):
+        """json.dumps of the request body must emit tic_scope as a string."""
         import json as _json
         seen = {}
 
@@ -1007,24 +1041,24 @@ class TestTicScopeCanonicalContract:
         cfg = CollectorConfig(
             from_date="2026-08-05",
             to_date="2026-08-05",
-            tic_scope=60,
+            tic_scope="60",
             output=str(tmp_path / "out.jsonl"),
             metadata_output=str(tmp_path / "out.meta.json"),
         )
         collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
         collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
         serialized = _json.dumps(seen["body"])
-        assert '"tic_scope": 60' in serialized
-        assert '"tic_scope": "60"' not in serialized
+        assert '"tic_scope": "60"' in serialized
+        assert '"tic_scope": 60' not in serialized
 
-    def test_cli_parses_tic_scope_as_int(self):
+    def test_cli_parses_tic_scope_as_string(self):
         from fmindex.market.kospi_collector import build_parser
         parser = build_parser()
         args = parser.parse_args(
             ["--from", "2026-08-05", "--to", "2026-08-05", "--tic-scope", "60"]
         )
-        assert type(args.tic_scope) is int
-        assert args.tic_scope == 60
+        assert type(args.tic_scope) is str
+        assert args.tic_scope == "60"
 
     def test_cli_rejects_invalid_tic_scope(self):
         from fmindex.market.kospi_collector import build_parser

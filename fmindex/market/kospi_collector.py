@@ -16,9 +16,13 @@ those are used directly. Minute buckets (tic_scope < 60) are aggregated
 into hourly OHLC: open=first open, high=max high, low=min low,
 close=last close, volume=sum (null if the API does not provide it).
 
-The Kiwoom live API requires tic_scope as a JSON number. Sending the
-string "60" is rejected with return_code=2 (type mismatch), so the
-canonical internal type is int and the CLI parses it as int.
+A controlled same-token/same-endpoint A/B probe against the live Kiwoom
+API confirmed the ka20005 wire contract is a JSON **string**: sending
+tic_scope="60" returns return_code=0 with data, while the JSON number 60
+returns return_code=2 (type mismatch). CLI and CollectorConfig therefore
+canonicalize tic_scope to a string, and invalid values fail fast before
+any API request. The single initial string-state live failure was not
+confirmed to be caused by the tic_scope string and is not recorded as one.
 
 Usage:
     python -m fmindex.market.kospi_collector --from 2026-07-01 --to 2026-08-05
@@ -88,48 +92,49 @@ DEFAULT_MAX_REQUESTS = 500
 #: Default overlap window (hours) re-fetched on incremental runs.
 DEFAULT_OVERLAP_HOURS = 8
 
-#: Allowed tic_scope values. The Kiwoom live API requires this value as a
-#: JSON number (integer); sending the string "60" is rejected with
-#: return_code=2 (type mismatch). The canonical internal type is int.
+#: Allowed tic_scope values. A controlled same-token/same-endpoint A/B
+#: probe against the live Kiwoom API confirmed the ka20005 wire contract is
+#: a JSON **string**: tic_scope="60" returns return_code=0 with data, while
+#: the JSON number 60 returns return_code=2 (type mismatch). The canonical
+#: internal type is therefore str.
 ALLOWED_TIC_SCOPES = (
-    1,
-    3,
-    5,
-    10,
-    15,
-    30,
-    45,
-    60,
+    "1",
+    "3",
+    "5",
+    "10",
+    "15",
+    "30",
+    "45",
+    "60",
 )
 
-#: Canonical string representations accepted for compatibility. Only exact
-#: matches are allowed (e.g. "60" -> 60, "05" is rejected).
-ALLOWED_TIC_SCOPE_STRINGS = tuple(str(v) for v in ALLOWED_TIC_SCOPES)
 
+def _canonicalize_tic_scope(value: Any) -> str:
+    """Return ``value`` as a canonical string tic_scope or raise ValueError.
 
-def _canonicalize_tic_scope(value: Any) -> int:
-    """Return ``value`` as a canonical int tic_scope or raise ValueError.
-
-    Accepted inputs:
-    - int in ALLOWED_TIC_SCOPES
-    - exact string form of an allowed value (e.g. "60" -> 60)
+    Accepted inputs (canonical wire form is always a string):
+    - string in ALLOWED_TIC_SCOPES (e.g. "60")
+    - int in {1,3,5,10,15,30,45,60} for programmatic compatibility
+      (converted to its exact string form, e.g. 60 -> "60")
 
     Rejected inputs raise ValueError before any API request is made:
-    0, 2, 59, 90, "abc", "05", None, True, False, floats, etc.
+    "0", "2", "59", "90", "05", "060", " 60", "60 ", "abc",
+    0, 2, 59, 90, None, True, False, floats, lists, dicts, etc.
     """
     if isinstance(value, bool):
         raise ValueError(
             f"invalid tic_scope {value!r}: expected one of {ALLOWED_TIC_SCOPES}"
         )
-    if isinstance(value, int):
+    if isinstance(value, str):
         if value in ALLOWED_TIC_SCOPES:
             return value
         raise ValueError(
             f"invalid tic_scope {value!r}: expected one of {ALLOWED_TIC_SCOPES}"
         )
-    if isinstance(value, str):
-        if value in ALLOWED_TIC_SCOPE_STRINGS:
-            return int(value)
+    if isinstance(value, int):
+        string_form = str(value)
+        if string_form in ALLOWED_TIC_SCOPES:
+            return string_form
         raise ValueError(
             f"invalid tic_scope {value!r}: expected one of {ALLOWED_TIC_SCOPES}"
         )
@@ -160,7 +165,7 @@ class CollectorConfig:
         request_delay: float = 1.0,
         force_refresh: bool = False,
         overlap_hours: int = DEFAULT_OVERLAP_HOURS,
-        tic_scope: int = 60,
+        tic_scope: str = "60",
     ) -> None:
         self.from_date = from_date
         self.to_date = to_date
@@ -171,8 +176,8 @@ class CollectorConfig:
         self.request_delay = request_delay
         self.force_refresh = force_refresh
         self.overlap_hours = overlap_hours
-        # Canonical int; validated here so the request body only ever
-        # carries an int tic_scope (never a string).
+        # Canonical string; validated here so the request body only ever
+        # carries a string tic_scope (the live API wire contract).
         self.tic_scope = _canonicalize_tic_scope(tic_scope)
 
 
@@ -302,7 +307,7 @@ class KospiCollector:
         body: Dict[str, Any] = {
             "mrkt_tp": KOSPI_MRKT_TP,
             "inds_cd": KOSPI_INDS_CD,
-            "tic_scope": (self.config.tic_scope if self.config else 60),
+            "tic_scope": (self.config.tic_scope if self.config else "60"),
             "base_dt": date_str,
         }
         pages = self.client.fetch_all(API_ID_MINUTE_CHART, SECTOR_PATH, body)
@@ -794,11 +799,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overlap-hours", type=int, default=DEFAULT_OVERLAP_HOURS)
     parser.add_argument(
         "--tic-scope",
-        type=int,
-        default=60,
+        default="60",
         choices=ALLOWED_TIC_SCOPES,
         help="Minute chart interval for ka20005 (1|3|5|10|15|30|45|60). "
-        "Sent to the Kiwoom API as a JSON number.",
+        "Sent to the Kiwoom API as a JSON string (the live wire contract).",
     )
     return parser
 

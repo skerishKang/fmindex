@@ -172,20 +172,29 @@ The dashboard UI files are not modified by this work.
 
 ## Offline contract alignment (PR #8 fix)
 
-### tic_scope is a JSON number (live API contract)
+### tic_scope is a JSON string (live wire contract)
 
-The Kiwoom live API requires `tic_scope` as a **JSON number** (integer).
-Sending the string `"60"` is rejected with `return_code=2`
-(`파라미터=tic_scope 실패사유= 타입 불일치`).
+A controlled same-token/same-endpoint A/B probe against the live Kiwoom
+API confirmed the ka20005 wire contract:
 
-- `CollectorConfig.tic_scope` canonical type is `int`.
-- The CLI `--tic-scope` parses as `int` and validates against
-  `ALLOWED_TIC_SCOPES = (1, 3, 5, 10, 15, 30, 45, 60)`.
-- String inputs such as `"60"` are canonicalized to `int 60` for
-  compatibility; any other value (`0`, `2`, `59`, `90`, `"abc"`, `"05"`,
-  `None`, `True`, `False`, floats) raises `ValueError` before any API
-  request is made (fail-fast).
-- The request body always carries an `int` `tic_scope`.
+- `tic_scope: "60"` (JSON string) → `return_code=0`, real data returned.
+- `tic_scope: 60` (JSON number) → `return_code=2`,
+  `파라미터=tic_scope 실패사유= 타입 불일치`.
+
+Therefore:
+
+- `CollectorConfig.tic_scope` canonical type is `str`.
+- The CLI `--tic-scope` accepts strings and validates against
+  `ALLOWED_TIC_SCOPES = ("1", "3", "5", "10", "15", "30", "45", "60")`.
+- Int inputs such as `60` are canonicalized to `"60"` for programmatic
+  compatibility; any other value (`"0"`, `"2"`, `"59"`, `"90"`, `"05"`,
+  `"060"`, `" 60"`, `"60 "`, `"abc"`, `0`, `2`, `59`, `90`, `None`,
+  `True`, `False`, floats, lists, dicts) raises `ValueError` before any
+  API request is made (fail-fast).
+- The request body always carries a `str` `tic_scope`.
+
+The root cause of the single initial string-state live failure is **not
+confirmed**; it is not attributed to the tic_scope string.
 
 ### Pagination uses response headers
 
