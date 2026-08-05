@@ -11,10 +11,18 @@ Endpoints (confirmed official contract):
   table: inds_dt_pole_qry — fields: cur_prc, trde_qty, dt, open_pric,
          high_pric, low_pric, trde_prica
 
-When the API returns true 60-minute index candles (tic_scope="60"),
+When the API returns true 60-minute index candles (tic_scope=60),
 those are used directly. Minute buckets (tic_scope < 60) are aggregated
 into hourly OHLC: open=first open, high=max high, low=min low,
 close=last close, volume=sum (null if the API does not provide it).
+
+A controlled same-token/same-endpoint A/B probe against the live Kiwoom
+API confirmed the ka20005 wire contract is a JSON **string**: sending
+tic_scope="60" returns return_code=0 with data, while the JSON number 60
+returns return_code=2 (type mismatch). CLI and CollectorConfig therefore
+canonicalize tic_scope to a string, and invalid values fail fast before
+any API request. The single initial string-state live failure was not
+confirmed to be caused by the tic_scope string and is not recorded as one.
 
 Usage:
     python -m fmindex.market.kospi_collector --from 2026-07-01 --to 2026-08-05
@@ -24,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -84,6 +93,56 @@ DEFAULT_MAX_REQUESTS = 500
 #: Default overlap window (hours) re-fetched on incremental runs.
 DEFAULT_OVERLAP_HOURS = 8
 
+#: Allowed tic_scope values. A controlled same-token/same-endpoint A/B
+#: probe against the live Kiwoom API confirmed the ka20005 wire contract is
+#: a JSON **string**: tic_scope="60" returns return_code=0 with data, while
+#: the JSON number 60 returns return_code=2 (type mismatch). The canonical
+#: internal type is therefore str.
+ALLOWED_TIC_SCOPES = (
+    "1",
+    "3",
+    "5",
+    "10",
+    "15",
+    "30",
+    "45",
+    "60",
+)
+
+
+def _canonicalize_tic_scope(value: Any) -> str:
+    """Return ``value`` as a canonical string tic_scope or raise ValueError.
+
+    Accepted inputs (canonical wire form is always a string):
+    - string in ALLOWED_TIC_SCOPES (e.g. "60")
+    - int in {1,3,5,10,15,30,45,60} for programmatic compatibility
+      (converted to its exact string form, e.g. 60 -> "60")
+
+    Rejected inputs raise ValueError before any API request is made:
+    "0", "2", "59", "90", "05", "060", " 60", "60 ", "abc",
+    0, 2, 59, 90, None, True, False, floats, lists, dicts, etc.
+    """
+    if isinstance(value, bool):
+        raise ValueError(
+            f"invalid tic_scope {value!r}: expected one of {ALLOWED_TIC_SCOPES}"
+        )
+    if isinstance(value, str):
+        if value in ALLOWED_TIC_SCOPES:
+            return value
+        raise ValueError(
+            f"invalid tic_scope {value!r}: expected one of {ALLOWED_TIC_SCOPES}"
+        )
+    if isinstance(value, int):
+        string_form = str(value)
+        if string_form in ALLOWED_TIC_SCOPES:
+            return string_form
+        raise ValueError(
+            f"invalid tic_scope {value!r}: expected one of {ALLOWED_TIC_SCOPES}"
+        )
+    raise ValueError(
+        f"invalid tic_scope {value!r}: expected one of {ALLOWED_TIC_SCOPES}"
+    )
+
 
 class NoTradingDaysError(RuntimeError):
     """Raised when the requested range contains no supported trading days.
@@ -118,7 +177,9 @@ class CollectorConfig:
         self.request_delay = request_delay
         self.force_refresh = force_refresh
         self.overlap_hours = overlap_hours
-        self.tic_scope = tic_scope
+        # Canonical string; validated here so the request body only ever
+        # carries a string tic_scope (the live API wire contract).
+        self.tic_scope = _canonicalize_tic_scope(tic_scope)
 
 
 class KospiCollector:
@@ -145,6 +206,13 @@ class KospiCollector:
         self.duplicates_removed = 0
         self.partial_buckets = 0
         self.warnings: List[str] = []
+        # Detailed row classification (never includes raw values).
+        self.target_date_rows = 0
+        self.other_date_rows = 0
+        self.invalid_timestamp_rows = 0
+        self.invalid_price_rows = 0
+        self.out_of_session_rows = 0
+        self.accepted_candles = 0
 
     # ------------------------------------------------------------------ #
     # Public API                                                          #
@@ -193,7 +261,7 @@ class KospiCollector:
     def collect_day(self, trade_date) -> List[HourlyIndexRecord]:
         """Collect hourly records for a single trading date.
 
-        Uses the official 60-minute index chart (ka20005, tic_scope="60")
+        Uses the official 60-minute index chart (ka20005, tic_scope=60)
         when available; falls back to aggregating minute candles otherwise.
         """
         if hasattr(trade_date, "strftime"):
@@ -263,6 +331,8 @@ class KospiCollector:
         - records_received: every raw row received from the API
         - records_rejected: rows rejected during parse/time/contract checks
         - records_accepted: final hourly records (counted in collect_day)
+        - target_date_rows / other_date_rows / invalid_timestamp_rows /
+          invalid_price_rows: detailed classification (no raw values)
         """
         candles: List[Candle] = []
         for page in pages:
@@ -271,21 +341,38 @@ class KospiCollector:
                 continue
             for row in rows:
                 self.records_received += 1
-                candle = self._candle_from_minute_row(row, date_str)
-                if candle is None:
+                status = self._row_timestamp_status(row, date_str)
+                if status == "other_date":
+                    self.other_date_rows += 1
                     self.records_rejected += 1
                     continue
+                if status == "invalid":
+                    self.invalid_timestamp_rows += 1
+                    self.records_rejected += 1
+                    continue
+                self.target_date_rows += 1
+                candle = self._candle_from_minute_row(row, date_str)
+                if candle is None:
+                    self.invalid_price_rows += 1
+                    self.records_rejected += 1
+                    continue
+                self.accepted_candles += 1
                 candles.append(candle)
         return candles
 
     def _candle_from_minute_row(
         self, row: Dict[str, Any], date_str: str
     ) -> Optional[Candle]:
-        """Map a ka20005 row to a Candle using official field names."""
-        o = self._float(row.get("open_pric"))
-        h = self._float(row.get("high_pric"))
-        l = self._float(row.get("low_pric"))
-        c = self._float(row.get("cur_prc"))
+        """Map a ka20005 row to a Candle using official field names.
+
+        OHLC uses ``_parse_price_magnitude`` (signed values become positive
+        magnitudes); volume uses ``_parse_nonnegative_number``. Rows from
+        dates other than ``date_str`` are rejected.
+        """
+        o = self._parse_price_magnitude(row.get("open_pric"))
+        h = self._parse_price_magnitude(row.get("high_pric"))
+        l = self._parse_price_magnitude(row.get("low_pric"))
+        c = self._parse_price_magnitude(row.get("cur_prc"))
         if o is None or h is None or l is None or c is None:
             return None
 
@@ -296,7 +383,7 @@ class KospiCollector:
         # Volume contract: only the per-candle trde_qty is used. acc_trde_qty
         # is a CUMULATIVE total for the day — summing it across rows would
         # fabricate volume, so it is never used as a per-candle volume.
-        volume = self._float(row.get("trde_qty"))
+        volume = self._parse_nonnegative_number(row.get("trde_qty"))
 
         bucket = bucket_for_timestamp(ts)
         is_partial = bool(bucket and bucket[1]) if bucket else False
@@ -414,15 +501,23 @@ class KospiCollector:
 
     @staticmethod
     def _is_valid_kospi_record(rec: HourlyIndexRecord) -> bool:
-        """Validate the full KOSPI instrument contract."""
+        """Validate the full KOSPI instrument contract (exact match only).
+
+        No substring matching: instrumentId must be exactly "001", symbol
+        exactly "KOSPI", market exactly "KOSPI". Any other instrument,
+        symbol, market, provider, asset type, or data mode is rejected.
+        """
         if rec.provider != PROVIDER:
             return False
         if rec.asset_type != ASSET_TYPE_INDEX:
             return False
         if rec.data_mode != DATA_MODE_REAL:
             return False
-        identity = f"{rec.instrument_id} {rec.symbol}".upper()
-        if KOSPI_INDS_CD not in identity and "KOSPI" not in identity:
+        if rec.instrument_id != KOSPI_INDS_CD:
+            return False
+        if rec.symbol.upper() != KOSPI_SYMBOL.upper():
+            return False
+        if rec.market.upper() != KOSPI_SYMBOL.upper():
             return False
         if rec.open is None or rec.high is None or rec.low is None or rec.close is None:
             return False
@@ -534,31 +629,161 @@ class KospiCollector:
             return None
 
     @staticmethod
+    def _parse_price_magnitude(value: Any) -> Optional[float]:
+        """Parse a signed OHLC value into a finite positive magnitude.
+
+        Kiwoom ka20005 OHLC strings may carry a leading ``+`` or ``-`` sign
+        that is a direction marker, separate from the index magnitude. Only
+        the absolute magnitude is used for open_pric/high_pric/low_pric/
+        cur_prc. Zero or negative final magnitudes, NaN, Infinity,
+        multiple/mixed signs, and non-numeric input are rejected (None).
+        """
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text in ("+", "-"):
+            return None
+        if text.count("+") > 1 or text.count("-") > 1:
+            return None
+        if "+" in text and "-" in text:
+            return None
+        try:
+            f = float(text)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(f):
+            return None
+        magnitude = abs(f)
+        if magnitude <= 0:
+            return None
+        return magnitude
+
+    @staticmethod
+    def _parse_nonnegative_number(value: Any) -> Optional[float]:
+        """Parse a non-negative quantity (e.g. trde_qty) or return None.
+
+        Rejects negative values, NaN, Infinity, mixed/multiple signs, and
+        non-numeric input. Never applies absolute-value normalization (a
+        negative quantity is invalid, not a positive one in disguise).
+        """
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text in ("+", "-"):
+            return None
+        if text.count("+") > 1 or text.count("-") > 1:
+            return None
+        if "+" in text and "-" in text:
+            return None
+        try:
+            f = float(text)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(f):
+            return None
+        if f < 0:
+            return None
+        return f
+
+    @staticmethod
+    def _row_timestamp_status(row: Dict[str, Any], date_str: str) -> str:
+        """Classify a row's cntr_tm without exposing the raw value.
+
+        Returns one of:
+        - ``target``: valid timestamp on the requested date
+        - ``other_date``: a well-formed 14-digit timestamp whose embedded
+          date differs from ``date_str`` (valid but not requested)
+        - ``invalid``: missing, malformed, or out-of-range timestamp
+        """
+        tm = row.get("cntr_tm")
+        if tm is None:
+            return "invalid"
+        raw = str(tm)
+        if raw != raw.strip():
+            # Leading/trailing extra characters are invalid.
+            return "invalid"
+        text = raw.strip()
+        if not text or not text.isdigit():
+            return "invalid"
+        if len(text) == 14:
+            try:
+                dt = datetime.strptime(text, "%Y%m%d%H%M%S")
+            except ValueError:
+                return "invalid"
+            if dt.strftime("%Y%m%d") != date_str:
+                return "other_date"
+            return "target"
+        if len(text) in (4, 6):
+            # Legacy fixture formats carry no embedded date; they are always
+            # interpreted against the requested date.
+            return "target"
+        return "invalid"
+
+    @staticmethod
     def _timestamp_from_row(row: Dict[str, Any], date_str: str) -> Optional[str]:
         """Build a KST-aware ISO timestamp from a chart row.
 
-        ka20005 rows carry ``cntr_tm`` (HHMMSS, KST intraday). When it is
-        missing the bucket is derived from the date at 09:00 (session
-        open) — a conservative fallback that never fabricates time.
+        Supported cntr_tm formats:
+        - 14 digits YYYYMMDDHHMMSS (the live ka20005 response format, e.g.
+          ``20260805150000``). The embedded date MUST equal ``date_str``;
+          rows from other dates are rejected, never relabelled.
+        - 6 digits HHMMSS (legacy fixture compatibility).
+        - 4 digits HHMM (legacy fixture compatibility).
+
+        Missing or malformed timestamps return None (no 09:00 fallback, no
+        fabricated time). Invalid dates/times are rejected.
         """
         tm = row.get("cntr_tm")
-        if not tm:
+        if tm is None:
             return None
-        text = str(tm).strip()
-        if len(text) == 4 and text.isdigit():
-            # HHMM -> HHMMSS (pad seconds on the right, never left).
-            text = text + "00"
-        if len(text) != 6 or not text.isdigit():
+        raw = str(tm)
+        if raw != raw.strip():
+            # Leading/trailing extra characters are rejected.
             return None
-        hour, minute = int(text[:2]), int(text[2:4])
-        if hour > 23 or minute > 59:
+        text = raw.strip()
+        if not text or not text.isdigit():
             return None
-        try:
-            return datetime.strptime(
-                f"{date_str} {hour:02d}:{minute:02d}", "%Y%m%d %H:%M"
-            ).replace(tzinfo=KST).isoformat()
-        except ValueError:
-            return None
+        if len(text) == 14:
+            try:
+                dt = datetime.strptime(text, "%Y%m%d%H%M%S")
+            except ValueError:
+                return None
+            if dt.strftime("%Y%m%d") != date_str:
+                # Other-date row: valid timestamp, but not the requested day.
+                return None
+            return dt.replace(tzinfo=KST).isoformat()
+        if len(text) == 6:
+            try:
+                hour, minute, second = int(text[:2]), int(text[2:4]), int(text[4:6])
+            except ValueError:
+                return None
+            if hour > 23 or minute > 59 or second > 59:
+                return None
+            try:
+                return datetime.strptime(
+                    f"{date_str} {hour:02d}:{minute:02d}:{second:02d}",
+                    "%Y%m%d %H:%M:%S",
+                ).replace(tzinfo=KST).isoformat()
+            except ValueError:
+                return None
+        if len(text) == 4:
+            try:
+                hour, minute = int(text[:2]), int(text[2:4])
+            except ValueError:
+                return None
+            if hour > 23 or minute > 59:
+                return None
+            try:
+                return datetime.strptime(
+                    f"{date_str} {hour:02d}:{minute:02d}", "%Y%m%d %H:%M"
+                ).replace(tzinfo=KST).isoformat()
+            except ValueError:
+                return None
+        return None
 
 
 def _record_from_dict(raw: Dict[str, Any]) -> HourlyIndexRecord:
@@ -721,8 +946,8 @@ def run_collector(config: CollectorConfig) -> Dict[str, Any]:
     }
 
 
-def main() -> None:
-    """CLI entry point."""
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser (exposed for CLI contract tests)."""
     parser = argparse.ArgumentParser(
         description="Collect KOSPI index hourly OHLC from the Kiwoom REST API"
     )
@@ -737,7 +962,19 @@ def main() -> None:
     parser.add_argument("--request-delay", type=float, default=1.0)
     parser.add_argument("--force-refresh", action="store_true")
     parser.add_argument("--overlap-hours", type=int, default=DEFAULT_OVERLAP_HOURS)
-    parser.add_argument("--tic-scope", default="60", choices=["1", "3", "5", "10", "15", "30", "45", "60"])
+    parser.add_argument(
+        "--tic-scope",
+        default="60",
+        choices=ALLOWED_TIC_SCOPES,
+        help="Minute chart interval for ka20005 (1|3|5|10|15|30|45|60). "
+        "Sent to the Kiwoom API as a JSON string (the live wire contract).",
+    )
+    return parser
+
+
+def main() -> None:
+    """CLI entry point."""
+    parser = build_parser()
     args = parser.parse_args()
 
     config = CollectorConfig(

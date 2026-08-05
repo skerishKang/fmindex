@@ -86,7 +86,7 @@ timestamps are converted to KST.
 
 ## Hourly OHLC aggregation
 
-When the API provides true 60-minute candles (`tic_scope="60"`) those are used
+When the API provides true 60-minute candles (`tic_scope=60`) those are used
 directly. For minute buckets, aggregation rules:
 
 - `open` = first candle open
@@ -164,13 +164,37 @@ The dashboard UI files are not modified by this work.
   (no `KIWOOM_APPKEY`/`KIWOOM_SECRETKEY` in this environment).
 - The 2026 public-holiday snapshot is best-effort; the KRX official calendar
   should be checked before live backfills over holiday dates.
-- 60-minute buckets are produced from `tic_scope="60"`; minute-level
+- 60-minute buckets are produced from `tic_scope=60`; minute-level
   aggregation (tic_scope < 60) is implemented and covered by tests but not
   exercised against the live API.
 
 ---
 
 ## Offline contract alignment (PR #8 fix)
+
+### tic_scope is a JSON string (live wire contract)
+
+A controlled same-token/same-endpoint A/B probe against the live Kiwoom
+API confirmed the ka20005 wire contract:
+
+- `tic_scope: "60"` (JSON string) → `return_code=0`, real data returned.
+- `tic_scope: 60` (JSON number) → `return_code=2`,
+  `파라미터=tic_scope 실패사유= 타입 불일치`.
+
+Therefore:
+
+- `CollectorConfig.tic_scope` canonical type is `str`.
+- The CLI `--tic-scope` accepts strings and validates against
+  `ALLOWED_TIC_SCOPES = ("1", "3", "5", "10", "15", "30", "45", "60")`.
+- Int inputs such as `60` are canonicalized to `"60"` for programmatic
+  compatibility; any other value (`"0"`, `"2"`, `"59"`, `"90"`, `"05"`,
+  `"060"`, `" 60"`, `"60 "`, `"abc"`, `0`, `2`, `59`, `90`, `None`,
+  `True`, `False`, floats, lists, dicts) raises `ValueError` before any
+  API request is made (fail-fast).
+- The request body always carries a `str` `tic_scope`.
+
+The root cause of the single initial string-state live failure is **not
+confirmed**; it is not attributed to the tic_scope string.
 
 ### Pagination uses response headers
 
@@ -202,16 +226,43 @@ check applies only on the `read_kospi_records` / collector path.
 
 ### Strict time parsing (no fabrication)
 
-`cntr_tm` (HHMM or HHMMSS, KST) is the only time source. Missing,
-non-numeric, wrong-length, `HH>23`, `MM>59` values are rejected. A missing
+`cntr_tm` is the only time source. Supported formats:
+
+- **14 digits `YYYYMMDDHHMMSS`** — the live ka20005 response format
+  (e.g. `20260805150000`). The embedded date MUST equal the requested
+  `base_dt`; rows from other dates are rejected, never relabelled.
+- **6 digits `HHMMSS`** — legacy fixture compatibility.
+- **4 digits `HHMM`** — legacy fixture compatibility.
+
+Missing, non-numeric, wrong-length, whitespace-padded, `HH>23`,
+`MM>59`, `SS>59`, or invalid-date values are rejected. A missing
 `cntr_tm` is **never** replaced with a fabricated 09:00 timestamp.
 Out-of-session timestamps are rejected by the bucket rules.
 
 Counting semantics (no double counting):
 
 - `recordsReceived` — raw rows received from the API
+- `targetDateRows` / `otherDateRows` / `invalidTimestampRows` /
+  `invalidPriceRows` — detailed classification (no raw values)
 - `recordsRejected` — rows rejected during parse/time/session/contract checks
 - `recordsAccepted` — final hourly records
+
+### Signed OHLC price magnitudes
+
+Live ka20005 OHLC strings may carry a leading `+` or `-` direction sign.
+`open_pric`/`high_pric`/`low_pric`/`cur_prc` are parsed with
+`_parse_price_magnitude`: the absolute finite magnitude is used, and
+zero/negative magnitudes, `NaN`, `Infinity`, and multi/mixed signs are
+rejected. `trde_qty` uses `_parse_nonnegative_number` — a negative volume
+is invalid (never abs-normalized), and `acc_trde_qty` (cumulative) is
+never used as per-candle volume.
+
+### Exact KOSPI identity
+
+`_is_valid_kospi_record` requires exact matches only (no substring
+search): `provider == "kiwoom"`, `instrumentId == "001"`,
+`symbol == "KOSPI"`, `market == "KOSPI"`, `assetType == "index"`,
+`dataMode == "real"`. Anything else is rejected.
 
 ### Volume policy
 

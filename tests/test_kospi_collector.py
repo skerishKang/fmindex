@@ -879,6 +879,530 @@ class TestMarketBridgeReal:
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# TIC_SCOPE_CANONICAL_INT / REQUEST_BODY_TIC_SCOPE_INT / INVALID_SCOPE_FAIL_FAST
+# --------------------------------------------------------------------------- #
+
+
+class TestTicScopeCanonicalContract:
+    """Canonical tic_scope contract: string wire type, fail-fast on invalid."""
+
+    def test_default_value_is_string(self):
+        cfg = CollectorConfig(from_date="2026-08-05", to_date="2026-08-05")
+        assert cfg.tic_scope == "60"
+        assert type(cfg.tic_scope) is str
+
+    def test_string_input_stays_string(self):
+        cfg = CollectorConfig(from_date="2026-08-05", to_date="2026-08-05", tic_scope="60")
+        assert cfg.tic_scope == "60"
+        assert type(cfg.tic_scope) is str
+
+    def test_int_compatible_input_canonicalized_to_string(self):
+        cfg = CollectorConfig(from_date="2026-08-05", to_date="2026-08-05", tic_scope=60)
+        assert cfg.tic_scope == "60"
+        assert type(cfg.tic_scope) is str
+
+    def test_all_allowed_scopes_are_strings(self):
+        from fmindex.market.kospi_collector import ALLOWED_TIC_SCOPES
+        for scope in ALLOWED_TIC_SCOPES:
+            cfg = CollectorConfig(
+                from_date="2026-08-05", to_date="2026-08-05", tic_scope=scope
+            )
+            assert type(cfg.tic_scope) is str
+            assert cfg.tic_scope == scope
+
+    def test_int_counterparts_canonicalize_to_string(self):
+        for wire, as_int in [
+            ("1", 1), ("3", 3), ("5", 5), ("10", 10),
+            ("15", 15), ("30", 30), ("45", 45), ("60", 60),
+        ]:
+            cfg = CollectorConfig(
+                from_date="2026-08-05", to_date="2026-08-05", tic_scope=as_int
+            )
+            assert cfg.tic_scope == wire
+            assert type(cfg.tic_scope) is str
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "0", "2", "59", "90", "05", "060", " 60", "60 ", "abc", "60.0",
+            0, 2, 59, 90, 60.0, None, True, False, [60], {"value": 60},
+        ],
+    )
+    def test_invalid_scope_fails_fast(self, bad):
+        with pytest.raises(ValueError):
+            CollectorConfig(from_date="2026-08-05", to_date="2026-08-05", tic_scope=bad)
+
+    def test_request_body_tic_scope_is_string(self, tmp_path):
+        """The body seen by the transport must carry a string tic_scope."""
+        seen = {}
+
+        def transport(url, body, headers):
+            seen["body"] = body
+            return make_minute_page(
+                [minute_row("0900", 3200, 3210, 3190, 3205)], cont_yn="N"
+            )
+
+        cfg = CollectorConfig(
+            from_date="2026-08-05",
+            to_date="2026-08-05",
+            tic_scope=60,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
+        fresh = collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
+        assert fresh is not None
+        assert "tic_scope" in seen["body"]
+        assert seen["body"]["tic_scope"] == "60"
+        assert type(seen["body"]["tic_scope"]) is str
+
+    def test_all_allowed_scopes_sent_as_string(self, tmp_path):
+        from fmindex.market.kospi_collector import ALLOWED_TIC_SCOPES
+        for scope in ALLOWED_TIC_SCOPES:
+            seen = {}
+
+            def transport(url, body, headers):
+                seen["body"] = body
+                return make_minute_page(
+                    [minute_row("0900", 3200, 3210, 3190, 3205)], cont_yn="N"
+                )
+
+            cfg = CollectorConfig(
+                from_date="2026-08-05",
+                to_date="2026-08-05",
+                tic_scope=scope,
+                output=str(tmp_path / f"out-{scope}.jsonl"),
+                metadata_output=str(tmp_path / f"out-{scope}.meta.json"),
+            )
+            collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
+            collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
+            assert type(seen["body"]["tic_scope"]) is str
+            assert seen["body"]["tic_scope"] == scope
+
+    def test_live_contract_mock_string_succeeds_int_fails(self, tmp_path):
+        """Mock the live API: str tic_scope succeeds, int tic_scope is rejected."""
+        seen = {}
+
+        def strict_transport(url, body, headers):
+            seen["body"] = body
+            if type(body.get("tic_scope")) is not str:
+                raise KiwoomAPIError(
+                    "Kiwoom API error [ka20005] return_code=2: "
+                    "파라미터=tic_scope 실패사유= 타입 불일치"
+                )
+            return make_minute_page(
+                [minute_row("0900", 3200, 3210, 3190, 3205)], cont_yn="N"
+            )
+
+        cfg = CollectorConfig(
+            from_date="2026-08-05",
+            to_date="2026-08-05",
+            tic_scope="60",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        assert type(cfg.tic_scope) is str
+        collector = KospiCollector(client=make_client(transport=strict_transport), config=cfg, request_delay=0.0)
+        collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
+        assert type(seen["body"]["tic_scope"]) is str
+
+    def test_int_wire_regression_guard(self, tmp_path):
+        """An int tic_scope in the request body must be rejected by the mock."""
+        seen = {}
+
+        def transport(url, body, headers):
+            seen["body"] = body
+            return make_minute_page([], cont_yn="N")
+
+        cfg = CollectorConfig(
+            from_date="2026-08-05",
+            to_date="2026-08-05",
+            tic_scope=60,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
+        collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
+        # Explicit guard: the production request body must NEVER carry int.
+        assert type(seen["body"]["tic_scope"]) is not int
+
+    def test_body_serialization_is_string(self, tmp_path):
+        """json.dumps of the request body must emit tic_scope as a string."""
+        import json as _json
+        seen = {}
+
+        def transport(url, body, headers):
+            seen["body"] = body
+            return make_minute_page(
+                [minute_row("0900", 3200, 3210, 3190, 3205)], cont_yn="N"
+            )
+
+        cfg = CollectorConfig(
+            from_date="2026-08-05",
+            to_date="2026-08-05",
+            tic_scope="60",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
+        collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
+        serialized = _json.dumps(seen["body"])
+        assert '"tic_scope": "60"' in serialized
+        assert '"tic_scope": 60' not in serialized
+
+    def test_cli_parses_tic_scope_as_string(self):
+        from fmindex.market.kospi_collector import build_parser
+        parser = build_parser()
+        args = parser.parse_args(
+            ["--from", "2026-08-05", "--to", "2026-08-05", "--tic-scope", "60"]
+        )
+        assert type(args.tic_scope) is str
+        assert args.tic_scope == "60"
+
+    def test_cli_rejects_invalid_tic_scope(self):
+        from fmindex.market.kospi_collector import build_parser
+        parser = build_parser()
+        import pytest as _pytest
+        with _pytest.raises(SystemExit):
+            parser.parse_args(
+                ["--from", "2026-08-05", "--to", "2026-08-05", "--tic-scope", "2"]
+            )
+
+    def test_invalid_scope_never_reaches_transport(self, tmp_path):
+        calls = []
+
+        def transport(url, body, headers):
+            calls.append(body)
+            return make_minute_page([], cont_yn="N")
+
+        with pytest.raises(ValueError):
+            CollectorConfig(
+                from_date="2026-08-05",
+                to_date="2026-08-05",
+                tic_scope=2,
+                output=str(tmp_path / "out.jsonl"),
+                metadata_output=str(tmp_path / "out.meta.json"),
+            )
+        assert calls == []
+
+    def test_existing_contract_preserved(self, tmp_path):
+        """inds_cd=001 / KOSPI / index / fail-closed still hold."""
+        from fmindex.market.kospi_collector import (
+            API_ID_MINUTE_CHART,
+            KOSPI_INDS_CD,
+            SECTOR_PATH,
+            TABLE_MINUTE,
+        )
+        from fmindex.market.models import ASSET_TYPE_INDEX, KOSPI_SYMBOL
+        assert API_ID_MINUTE_CHART == "ka20005"
+        assert SECTOR_PATH == "/api/dostk/chart"
+        assert TABLE_MINUTE == "inds_min_pole_qry"
+        assert KOSPI_INDS_CD == "001"
+        assert KOSPI_SYMBOL == "KOSPI"
+        assert ASSET_TYPE_INDEX == "index"
+
+
+# --------------------------------------------------------------------------- #
+# CNTR_TM_14_DIGIT / DATE FILTER / NO_FALLBACK                                #
+# --------------------------------------------------------------------------- #
+
+
+class TestCntrTmTimestampContract:
+    """14-digit YYYYMMDDHHMMSS live contract + legacy 4/6-digit formats."""
+
+    def test_14_digit_parses(self):
+        c = make_collector()
+        assert c._timestamp_from_row({"cntr_tm": "20260805150000"}, "20260805") == \
+            "2026-08-05T15:00:00+09:00"
+
+    def test_14_digit_with_seconds(self):
+        c = make_collector()
+        assert c._timestamp_from_row({"cntr_tm": "20260805145959"}, "20260805") == \
+            "2026-08-05T14:59:59+09:00"
+
+    def test_request_date_mismatch_rejected(self):
+        c = make_collector()
+        assert c._timestamp_from_row({"cntr_tm": "20260804150000"}, "20260805") is None
+
+    def test_invalid_date_rejected(self):
+        c = make_collector()
+        assert c._timestamp_from_row({"cntr_tm": "20260230090000"}, "20260805") is None
+
+    @pytest.mark.parametrize("bad", ["20260805240000", "20260805156000", "20260805150060"])
+    def test_invalid_time_rejected(self, bad):
+        c = make_collector()
+        assert c._timestamp_from_row({"cntr_tm": bad}, "20260805") is None
+
+    def test_legacy_6_digit_parses(self):
+        c = make_collector()
+        assert c._timestamp_from_row({"cntr_tm": "150000"}, "20260805") == \
+            "2026-08-05T15:00:00+09:00"
+
+    def test_legacy_4_digit_parses(self):
+        c = make_collector()
+        assert c._timestamp_from_row({"cntr_tm": "1500"}, "20260805") == \
+            "2026-08-05T15:00:00+09:00"
+
+    @pytest.mark.parametrize("bad", [None, "", "   ", "1500x", "+20260805150000",
+                                     "20260805150000.0", "1500 ", "1500000"])
+    def test_missing_or_malformed_rejected_no_fallback(self, bad):
+        c = make_collector()
+        assert c._timestamp_from_row({"cntr_tm": bad}, "20260805") is None
+
+    def test_status_classification(self):
+        c = make_collector()
+        assert c._row_timestamp_status({"cntr_tm": "20260805150000"}, "20260805") == "target"
+        assert c._row_timestamp_status({"cntr_tm": "20260804150000"}, "20260805") == "other_date"
+        assert c._row_timestamp_status({"cntr_tm": "150000"}, "20260805") == "target"
+        assert c._row_timestamp_status({"cntr_tm": None}, "20260805") == "invalid"
+        assert c._row_timestamp_status({"cntr_tm": "20260805240000"}, "20260805") == "invalid"
+
+    def test_mixed_historical_rows_filtered(self, tmp_path):
+        """Only the requested-date rows produce output."""
+        seen = {}
+
+        def transport(url, body, headers):
+            seen["body"] = body
+            return make_minute_page(
+                [
+                    minute_row("20260805150000", 3200, 3210, 3190, 3205),
+                    minute_row("20260805140000", 3205, 3215, 3195, 3210),
+                    minute_row("20260804150000", 3100, 3110, 3090, 3105),
+                    minute_row("20260803150000", 3000, 3010, 2990, 3005),
+                ],
+                cont_yn="N",
+            )
+
+        cfg = CollectorConfig(
+            from_date="2026-08-05", to_date="2026-08-05", tic_scope=60,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
+        records = collector.collect_day(__import__("datetime").date(2026, 8, 5))
+        assert records
+        for rec in records:
+            assert rec.timestamp.startswith("2026-08-05")
+        assert collector.other_date_rows == 2
+        assert collector.target_date_rows == 2
+
+    def test_pagination_mixed_dates(self, tmp_path):
+        """Pagination terminates; other-date rows excluded from output."""
+        def transport(url, body, headers):
+            page = make_minute_page(
+                [
+                    minute_row("20260805140000", 3205, 3215, 3195, 3210),
+                    minute_row("20260804140000", 3100, 3110, 3090, 3105),
+                ],
+                cont_yn="Y", next_key="page2",
+            )
+            page2 = make_minute_page(
+                [minute_row("20260803140000", 3000, 3010, 2990, 3005)],
+                cont_yn="N",
+            )
+            if headers.get("next-key") == "page2":
+                return page2
+            return page
+
+        cfg = CollectorConfig(
+            from_date="2026-08-05", to_date="2026-08-05", tic_scope=60,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
+        records = collector.collect_day(__import__("datetime").date(2026, 8, 5))
+        assert records
+        assert all(r.timestamp.startswith("2026-08-05") for r in records)
+        assert collector.other_date_rows == 2
+
+
+# --------------------------------------------------------------------------- #
+# SIGNED_PRICE_MAGNITUDE / NONNEGATIVE_VOLUME                                 #
+# --------------------------------------------------------------------------- #
+
+
+class TestSignedPriceMagnitude:
+    """Signed OHLC magnitude handling and volume policy."""
+
+    def test_unsigned_ohlc(self):
+        c = make_collector()
+        assert c._parse_price_magnitude("3200") == 3200.0
+
+    def test_plus_prefixed(self):
+        c = make_collector()
+        assert c._parse_price_magnitude("+3200.25") == 3200.25
+
+    def test_minus_prefixed(self):
+        c = make_collector()
+        assert c._parse_price_magnitude("-3200.25") == 3200.25
+
+    def test_mixed_sign_ohlc(self):
+        c = make_collector()
+        assert c._parse_price_magnitude("-3200") == 3200.0
+        assert c._parse_price_magnitude("+3210") == 3210.0
+        assert c._parse_price_magnitude("-3190") == 3190.0
+        assert c._parse_price_magnitude("+3205") == 3205.0
+
+    @pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity", "+", "-",
+                                     "++3200", "--3200", "+-3200", "abc", None, "",
+                                     "0", "-0", "0.0"])
+    def test_rejected_prices(self, bad):
+        c = make_collector()
+        assert c._parse_price_magnitude(bad) is None
+
+    def test_negative_volume_not_abs_normalized(self):
+        c = make_collector()
+        assert c._parse_nonnegative_number("-100") is None
+
+    def test_nonnegative_volume(self):
+        c = make_collector()
+        assert c._parse_nonnegative_number("0") == 0.0
+        assert c._parse_nonnegative_number("28852") == 28852.0
+        assert c._parse_nonnegative_number("NaN") is None
+        assert c._parse_nonnegative_number(None) is None
+
+    def test_signed_ohlc_full_candle(self, tmp_path):
+        """A full signed-ohlc row becomes a valid candle with magnitude."""
+        c = make_collector()
+        row = {
+            "cntr_tm": "20260805150000",
+            "open_pric": "-3200.25",
+            "high_pric": "+3210.50",
+            "low_pric": "-3190.10",
+            "cur_prc": "+3205.75",
+            "trde_qty": "1000",
+        }
+        candle = c._candle_from_minute_row(row, "20260805")
+        assert candle is not None
+        assert candle.open == 3200.25
+        assert candle.high == 3210.50
+        assert candle.low == 3190.10
+        assert candle.close == 3205.75
+        assert candle.volume == 1000.0
+
+    def test_acc_volume_not_used(self, tmp_path):
+        """acc_trde_qty presence without trde_qty yields null volume."""
+        c = make_collector()
+        row = {
+            "cntr_tm": "20260805150000",
+            "open_pric": "3200",
+            "high_pric": "3210",
+            "low_pric": "3190",
+            "cur_prc": "3205",
+            "acc_trde_qty": "999999",
+        }
+        candle = c._candle_from_minute_row(row, "20260805")
+        assert candle is not None
+        assert candle.volume is None
+
+
+# --------------------------------------------------------------------------- #
+# EXACT_KOSPI_IDENTITY                                                        #
+# --------------------------------------------------------------------------- #
+
+
+class TestExactKospiIdentity:
+    """_is_valid_kospi_record uses exact matching, never substrings."""
+
+    def test_accept_exact(self):
+        collector = make_collector()
+        assert collector._is_valid_kospi_record(make_record())
+
+    def test_reject_other_instrument(self):
+        collector = make_collector()
+        assert not collector._is_valid_kospi_record(make_record(instrument_id="101", symbol="KOSDAQ"))
+        assert not collector._is_valid_kospi_record(make_record(instrument_id="1001", symbol="KOSPI"))
+        assert not collector._is_valid_kospi_record(make_record(instrument_id="001234", symbol="KOSPI"))
+        assert not collector._is_valid_kospi_record(make_record(instrument_id="005930", symbol="삼성전자"))
+
+    def test_reject_symbol_mismatch(self):
+        collector = make_collector()
+        assert not collector._is_valid_kospi_record(make_record(instrument_id="001", symbol="KOSDAQ"))
+        assert not collector._is_valid_kospi_record(make_record(instrument_id="001", symbol="KOSPI200"))
+
+    def test_reject_market_mismatch(self):
+        collector = make_collector()
+        rec = make_record()
+        rec.market = "KOSDAQ"
+        assert not collector._is_valid_kospi_record(rec)
+
+    def test_reject_provider_mismatch(self):
+        collector = make_collector()
+        rec = make_record()
+        rec.provider = "sample"
+        assert not collector._is_valid_kospi_record(rec)
+
+    def test_reject_asset_type_mismatch(self):
+        collector = make_collector()
+        rec = make_record()
+        rec.asset_type = "stock"
+        assert not collector._is_valid_kospi_record(rec)
+
+    def test_reject_data_mode_mismatch(self):
+        collector = make_collector()
+        rec = make_record()
+        rec.data_mode = "sample"
+        assert not collector._is_valid_kospi_record(rec)
+
+
+# --------------------------------------------------------------------------- #
+# PRODUCTION_PATH_LIVE_LIKE_FIXTURE                                           #
+# --------------------------------------------------------------------------- #
+
+
+class TestProductionPathFixture:
+    """End-to-end collector path with live-like signed/14-digit fixture."""
+
+    def test_production_path_fixture(self, tmp_path):
+        seen_bodies = []
+
+        def transport(url, body, headers):
+            seen_bodies.append(body)
+            page1 = make_minute_page(
+                [
+                    minute_row("20260805150000", -3200.25, 3210.50, -3190.10, 3205.75),
+                    minute_row("20260805140000", 3195.0, 3210.0, 3190.0, 3200.0),
+                    minute_row("20260804150000", 3000.0, 3010.0, 2990.0, 3005.0),
+                ],
+                cont_yn="Y", next_key="page2",
+            )
+            page2 = make_minute_page(
+                [minute_row("20260803150000", 2900.0, 2910.0, 2890.0, 2905.0)],
+                cont_yn="N",
+            )
+            if headers.get("next-key") == "page2":
+                return page2
+            return page1
+
+        cfg = CollectorConfig(
+            from_date="2026-08-05", to_date="2026-08-05", tic_scope=60,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
+        records = collector.collect_day(__import__("datetime").date(2026, 8, 5))
+
+        # tic_scope wire type is a string
+        assert type(seen_bodies[0]["tic_scope"]) is str
+        assert seen_bodies[0]["tic_scope"] == "60"
+
+        # Only requested-date rows become hourly records
+        assert records
+        assert all(r.timestamp.startswith("2026-08-05") for r in records)
+        assert collector.target_date_rows == 2
+        assert collector.other_date_rows == 2
+        assert collector.accepted_candles == 2
+        # 15:00 partial bucket
+        partial = [r for r in records if r.timestamp.endswith("T15:00:00+09:00")]
+        assert partial and partial[0].is_partial
+        # All values positive
+        for r in records:
+            assert r.open > 0 and r.high > 0 and r.low > 0 and r.close > 0
+            assert r.high >= max(r.open, r.close)
+            assert r.low <= min(r.open, r.close)
+
+
 class TestPipelineRealContract:
     def test_pipeline_real_mode_contract_pass(self, tmp_path):
         """kiwoom mode with a validated KOSPI file yields real data."""
