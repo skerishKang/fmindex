@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .market.bridge import MarketBridge, MarketRecord
-from .fmkorea.parser import FMKoreaParser, ParsedPost
+from .fmkorea.parser import FMKoreaParser, ParsedPost, Comment
 from .llm.provider import LLMProvider, create_provider
 from .fmindex_calc import FMIndexCalculator, PostWithSentiment, METHODOLOGY_VERSION
 from .market_join import MarketSentimentJoiner
@@ -30,6 +30,8 @@ def run_pipeline_once(
     market_data_path: Optional[str] = None,
     market_source: str = "auto",
     fmkorea_fixture_dir: Optional[str] = None,
+    fmkorea_source: str = "fixture",
+    fmkorea_data_path: Optional[str] = None,
     output_dir: Optional[str] = None,
     llm_provider: Optional[LLMProvider] = None,
 ) -> Dict[str, Any]:
@@ -129,32 +131,54 @@ def run_pipeline_once(
     fixture_dir = Path(fmkorea_fixture_dir or FIXTURE_DIR)
     parser = FMKoreaParser()
     posts: List[ParsedPost] = []
+    community_source = fmkorea_source
+    community_data_mode = fmkorea_source
 
-    try:
-        posts = parser.parse_fixture_dir(str(fixture_dir))
+    if fmkorea_source == "live":
+        posts = _load_live_posts(fmkorea_data_path)
+        if not posts:
+            raise RuntimeError(
+                "FMKorea live mode requested but no validated posts found "
+                "(missing/empty/contract-invalid JSONL). Sample posts were NOT substituted."
+            )
+        community_source = "fmkorea-stock"
+        community_data_mode = "real"
         results["steps"].append({
             "step": "fmkorea_parse",
             "status": "ok",
             "posts": len(posts),
             "comments": sum(len(p.comments) for p in posts),
-            "source": str(fixture_dir),
+            "source": "live-normalized-jsonl",
+            "dataMode": "real",
         })
-    except FileNotFoundError as e:
-        results["steps"].append({
-            "step": "fmkorea_parse",
-            "status": "fail",
-            "error": str(e),
-        })
+    else:
+        try:
+            posts = parser.parse_fixture_dir(str(fixture_dir))
+            results["steps"].append({
+                "step": "fmkorea_parse",
+                "status": "ok",
+                "posts": len(posts),
+                "comments": sum(len(p.comments) for p in posts),
+                "source": str(fixture_dir),
+            })
+        except FileNotFoundError as e:
+            results["steps"].append({
+                "step": "fmkorea_parse",
+                "status": "fail",
+                "error": str(e),
+            })
 
-    # Fallback to sample posts
-    if not posts:
-        posts = _generate_sample_posts()
-        results["steps"].append({
-            "step": "fmkorea_parse",
-            "status": "sample",
-            "posts": len(posts),
-            "note": "Using sample posts (fixtures not found)",
-        })
+        # Fallback to sample posts only in fixture/sample modes (never live).
+        if not posts:
+            posts = _generate_sample_posts()
+            community_source = "sample"
+            community_data_mode = "sample"
+            results["steps"].append({
+                "step": "fmkorea_parse",
+                "status": "sample",
+                "posts": len(posts),
+                "note": "Using sample posts (fixtures not found)",
+            })
 
     # --- Step 3: LLM sentiment analysis ---
     provider = llm_provider or create_provider()
@@ -223,6 +247,12 @@ def run_pipeline_once(
     if not market_provider:
         market_provider = market_source
 
+    seen_times = [
+        t for t in (p.firstSeenAt or p.publishedAt for p in posts) if t
+    ]
+    community_first_seen = min(seen_times) if seen_times else None
+    community_last_seen = max(seen_times) if seen_times else None
+
     summary = {
         "totalPosts": total_posts,
         "totalComments": total_comments,
@@ -238,6 +268,12 @@ def run_pipeline_once(
         "symbol": symbol,
         "assetType": asset_type,
         "dataMode": data_mode,
+        "communitySource": community_source,
+        "communityDataMode": community_data_mode,
+        "communityPosts": total_posts,
+        "communityComments": total_comments,
+        "communityFirstSeenAt": community_first_seen,
+        "communityLastSeenAt": community_last_seen,
         "methodologyVersion": METHODOLOGY_VERSION,
         "lastUpdated": datetime.now(KST).isoformat(),
     }
@@ -318,6 +354,65 @@ def _generate_sample_market() -> List[MarketRecord]:
     return records
 
 
+def _load_live_posts(data_path: Optional[str]) -> List[ParsedPost]:
+    """Load normalized live FMKorea posts from a JSONL file.
+
+    Fail-closed: missing file, empty file, invalid JSON, wrong source, or
+    wrong dataMode raises. Only ``source == "fmkorea-stock"`` and
+    ``dataMode == "real"`` records are accepted.
+    """
+    if not data_path:
+        raise RuntimeError(
+            "FMKorea live mode requires --fmkorea-data <jsonl path>"
+        )
+    path = Path(data_path)
+    if not path.exists():
+        raise RuntimeError(f"FMKorea live data file not found: {path}")
+
+    posts: List[ParsedPost] = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"FMKorea live JSONL line {lineno} is not valid JSON: {e}"
+            )
+        if raw.get("source") != "fmkorea-stock":
+            raise RuntimeError(
+                f"FMKorea live JSONL line {lineno}: source must be fmkorea-stock"
+            )
+        if raw.get("dataMode") != "real":
+            raise RuntimeError(
+                f"FMKorea live JSONL line {lineno}: dataMode must be real"
+            )
+        comments = [
+            Comment(
+                body=c.get("body", ""),
+                publishedAt=c.get("publishedAt", ""),
+                recommendationCount=c.get("recommendationCount", 0),
+            )
+            for c in raw.get("comments", [])
+        ]
+        posts.append(
+            ParsedPost(
+                sourcePostId=str(raw.get("sourcePostId", "")),
+                url=raw.get("canonicalUrl", "") or "",
+                title=raw.get("title", "") or "",
+                body=raw.get("body", "") or "",
+                publishedAt=raw.get("publishedAt") or "",
+                firstSeenAt=raw.get("firstSeenAt") or "",
+                viewCount=raw.get("viewCount", 0) or 0,
+                recommendationCount=raw.get("recommendationCount", 0) or 0,
+                commentCount=raw.get("commentCount", 0) or 0,
+                comments=comments,
+            )
+        )
+    return posts
+
+
 def _generate_sample_posts() -> List[ParsedPost]:
     """Generate sample FMKorea posts for testing."""
     now = datetime.now(KST).replace(minute=0, second=0, microsecond=0)
@@ -385,6 +480,20 @@ def main():
         help="Path to FMKorea fixture directory",
     )
     parser.add_argument(
+        "--fmkorea-source",
+        type=str,
+        default="fixture",
+        choices=["fixture", "live", "sample"],
+        help="FMKorea community source: fixture (default), live "
+        "(verified normalized JSONL, fail-closed), sample (explicit)",
+    )
+    parser.add_argument(
+        "--fmkorea-data",
+        type=str,
+        default=None,
+        help="Path to live normalized FMKorea JSONL (used with --fmkorea-source live)",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -408,6 +517,8 @@ def main():
             market_data_path=args.market_data,
             market_source=args.market_source,
             fmkorea_fixture_dir=args.fmkorea_dir,
+            fmkorea_source=args.fmkorea_source,
+            fmkorea_data_path=args.fmkorea_data,
             output_dir=args.output_dir,
         )
 
@@ -430,6 +541,8 @@ def main():
                 market_data_path=args.market_data,
                 market_source=args.market_source,
                 fmkorea_fixture_dir=args.fmkorea_dir,
+                fmkorea_source=args.fmkorea_source,
+                fmkorea_data_path=args.fmkorea_data,
                 output_dir=args.output_dir,
             )
         print(f"\nServing dashboard from {out_dir}...")
