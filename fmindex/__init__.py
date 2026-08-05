@@ -1,13 +1,12 @@
-"""FMIndex package — FM-Index data structure + Integration Slice 1 pipeline."""
+"""FMIndex — 펨코지수 서비스 (키움 시장 데이터 + 펨코 심리분석 + Chart.js 대시보드)."""
 
-from .index import FMIndex
-from .bwt import bwt_from_suffix_array, inverse_bwt, build_suffix_array
-
+__version__ = "0.1.0"
 __all__ = [
-    "FMIndex",
-    "bwt_from_suffix_array",
-    "inverse_bwt",
-    "build_suffix_array",
+    "pipeline",
+    "market",
+    "fmkorea",
+    "llm",
+    "fmindex_calc",
+    "market_join",
+    "dashboard",
 ]
-
-__version__ = "2.0.0"

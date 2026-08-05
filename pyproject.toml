@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fmindex"
-version = "2.0.0"
+version = "0.1.0"
 description = "FMIndex — 펨코지수 서비스 (키움 시장 데이터 + 펨코 심리분석 + Chart.js 대시보드)"
 requires-python = ">=3.8"
 

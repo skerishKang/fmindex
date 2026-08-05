@@ -61,3 +61,6 @@ Thumbs.db
 *.tmp
 *.bak
 *.swp
+
+# Build artifacts
+*.egg-info/

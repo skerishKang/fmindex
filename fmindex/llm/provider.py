@@ -159,8 +159,8 @@ class MockLLMProvider(LLMProvider):
 def create_provider() -> LLMProvider:
     """Factory: create LLM provider based on environment variables.
 
-    If FMINDEX_LLM_PROVIDER is set and not 'mock', returns a real provider.
-    Otherwise returns the deterministic mock provider.
+    If FMINDEX_LLM_PROVIDER is 'mock' or unset, returns MockLLMProvider.
+    Any other provider name raises NotImplementedError until implemented.
     """
     provider = os.environ.get("FMINDEX_LLM_PROVIDER", "mock")
     model = os.environ.get("FMINDEX_LLM_MODEL", "mock-deterministic-v1")
@@ -168,6 +168,7 @@ def create_provider() -> LLMProvider:
     if provider == "mock" or not provider:
         return MockLLMProvider(model_name=model)
 
-    # Real providers would be implemented here
-    # For now, fall back to mock
-    return MockLLMProvider(model_name=f"{provider}:{model}")
+    raise NotImplementedError(
+        f"LLM provider '{provider}' is not yet implemented. "
+        f"Set FMINDEX_LLM_PROVIDER=mock to use the deterministic mock provider."
+    )

@@ -4,9 +4,52 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+KST = timezone(timedelta(hours=9))
+
+
+def filter_by_period(data: List[Dict[str, Any]], period: str) -> List[Dict[str, Any]]:
+    """Filter joined records by timestamp-based period.
+
+    Args:
+        data: List of joined records with 'timestamp' field.
+        period: '24h', '7d', '30d', or 'all'.
+
+    Returns:
+        Filtered list of records.
+    """
+    if period == "all":
+        return data
+
+    now = datetime.now(KST)
+    if period == "24h":
+        cutoff = now - timedelta(hours=24)
+    elif period == "7d":
+        cutoff = now - timedelta(days=7)
+    elif period == "30d":
+        cutoff = now - timedelta(days=30)
+    else:
+        return data
+
+    result = []
+    for rec in data:
+        ts = rec.get("timestamp", "")
+        try:
+            rec_dt = datetime.fromisoformat(ts)
+            if rec_dt.tzinfo is None:
+                rec_dt = rec_dt.replace(tzinfo=KST)
+            else:
+                rec_dt = rec_dt.astimezone(KST)
+            if rec_dt >= cutoff:
+                result.append(rec)
+        except (ValueError, TypeError):
+            continue
+
+    return result
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -44,11 +87,14 @@ h2 { font-size: 14px; margin: 16px 0 8px; color: var(--muted); }
 .eval-row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; }
 .eval-row .match { color: var(--green); }
 .eval-row .nomatch { color: var(--red); }
+.badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin-left: 8px; vertical-align: middle; }
+.badge.sample { background: #3a3320; color: var(--yellow); border: 1px solid #5a4d2a; }
+.badge.real { background: #14331c; color: var(--green); border: 1px solid #245a2e; }
 .empty { text-align: center; padding: 40px; color: var(--muted); }
 </style>
 </head>
 <body>
-<h1>📊 FMIndex — 펨코지수 대시보드</h1>
+<h1>📊 FMIndex — 펨코지수 대시보드<span id="modeBadge"></span></h1>
 <div id="dashboard"></div>
 <script>
 let chart = null;
@@ -67,14 +113,32 @@ async function loadData() {
 
 function filterByPeriod(data, period) {
   if (period === 'all') return data;
-  const hours = period === '24h' ? 24 : period === '7d' ? 168 : 720;
-  return data.slice(-hours);
+  const now = new Date();
+  let cutoff;
+  if (period === '24h') {
+    cutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  } else if (period === '7d') {
+    cutoff = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  } else if (period === '30d') {
+    cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  } else {
+    return data;
+  }
+  return data.filter(d => new Date(d.timestamp) >= cutoff);
 }
 
 function render() {
   const joined = allData.joined || [];
   const overnight = allData.overnight || null;
   const summary = allData.summary || {};
+
+  const dataMode = summary.dataMode || 'unknown';
+  const modeBadge = document.getElementById('modeBadge');
+  if (modeBadge) {
+    modeBadge.textContent = dataMode === 'sample' ? '샘플 데이터' : dataMode === 'real' ? '실시간 데이터' : dataMode;
+    modeBadge.className = 'badge ' + (dataMode === 'sample' ? 'sample' : dataMode === 'real' ? 'real' : '');
+  }
+
   if (joined.length === 0) {
     document.getElementById('dashboard').innerHTML = '<div class="empty">데이터가 없습니다.</div>';
     return;
@@ -82,13 +146,16 @@ function render() {
   const filtered = filterByPeriod(joined, currentPeriod);
   const latest = filtered[filtered.length - 1] || {};
   const prev = filtered[filtered.length - 2] || {};
-  const fmChange = latest.fmIndex && prev.fmIndex ? (latest.fmIndex - prev.fmIndex).toFixed(2) : '0.00';
+
+  const latestFm = latest.fmIndex;
+  const prevFm = prev.fmIndex;
+  const fmChange = (latestFm != null && prevFm != null) ? (latestFm - prevFm).toFixed(2) : '0.00';
 
   let html = '<div class="cards">';
-  html += card('현재 펨코지수', latest.fmIndex ? latest.fmIndex.toFixed(1) : '-', fmChange > 0 ? 'green' : fmChange < 0 ? 'red' : '', '최근 1시간 변화: ' + fmChange);
-  html += card('코스피 정규화', latest.marketNormalized ? latest.marketNormalized.toFixed(2) : '-', '', '', '기준=100');
-  html += card('코스피 변동률', latest.marketChangeRate != null ? latest.marketChangeRate.toFixed(2) + '%' : '-', latest.marketChangeRate >= 0 ? 'green' : 'red', '');
-  html += card('분석 게시글', latest.postCount != null ? latest.postCount : '0', '', '', '신뢰도: ' + (latest.confidence ? (latest.confidence * 100).toFixed(0) + '%' : '-'));
+  html += card('현재 펨코지수', latestFm != null ? latestFm.toFixed(1) : '-', '', '');
+  html += card('코스피 정규화', latest.marketNormalized != null ? latest.marketNormalized.toFixed(2) : '-', '', '', '기준=100');
+  html += card('코스피 변동률', latest.marketChangeRate != null ? latest.marketChangeRate.toFixed(2) + '%' : '-', '', '');
+  html += card('분석 게시글', latest.postCount != null ? latest.postCount : '0', '', '', '신뢰도: ' + (latest.confidence != null ? (latest.confidence * 100).toFixed(0) + '%' : '-'));
   html += card('마지막 데이터', latest.timestamp ? latest.timestamp.slice(11, 16) : '-', '', '', latest.timestamp ? latest.timestamp.slice(0, 10) : '');
   html += '</div>';
 
@@ -103,16 +170,8 @@ function render() {
   if (overnight) {
     html += '<h2>야간 심리 vs 다음 장 결과</h2>';
     html += '<div class="eval-card"><div class="eval-grid">';
-    html += '<div><div class="eval-row"><span>야간 평균 펨코지수</span><b>' + (overnight.overnight.averageFmIndex||'-') + '</b></div>';
-    html += '<div class="eval-row"><span>야간 최저</span><b>' + (overnight.overnight.minimumFmIndex||'-') + '</b></div>';
-    html += '<div class="eval-row"><span>야간 마지막</span><b>' + (overnight.overnight.lastFmIndex||'-') + '</b></div>';
-    html += '<div class="eval-row"><span>신호</span><b>' + (overnight.overnight.signal||'-') + '</b></div></div>';
-    html += '<div><div class="eval-row"><span>시가 변화</span><b>' + (overnight.kospi.openChangeRate||0) + '%</b></div>';
-    html += '<div class="eval-row"><span>장초 변화</span><b>' + (overnight.kospi.firstHourChangeRate||0) + '%</b></div>';
-    html += '<div class="eval-row"><span>종가 변화</span><b>' + (overnight.kospi.closeChangeRate||0) + '%</b></div>';
-    html += '<div class="eval-row"><span>시가 일치</span><b class="' + (overnight.matches.open?'match':'nomatch') + '">' + (overnight.matches.open?'✓':'✗') + '</b></div>';
-    html += '<div class="eval-row"><span>장초 일치</span><b class="' + (overnight.matches.firstHour?'match':'nomatch') + '">' + (overnight.matches.firstHour?'✓':'✗') + '</b></div>';
-    html += '<div class="eval-row"><span>종가 일치</span><b class="' + (overnight.matches.close?'match':'nomatch') + '">' + (overnight.matches.close?'✓':'✗') + '</b></div></div>';
+    html += '<div><div class="eval-row"><span>야간 상태</span><b>' + (overnight.overnight.status || '-') + '</b></div>';
+    html += '<div class="eval-row"><span>사유</span><b>' + (overnight.overnight.reason || '-') + '</b></div></div>';
     html += '</div></div>';
   }
 
@@ -131,7 +190,7 @@ function render() {
 }
 
 function card(label, value, cls, sub) {
-  return '<div class="card"><div class="label">'+label+'</div><div class="value '+(cls||'')+'">'+value+'</div>'+(sub?'<div class="sub">'+sub+'</div>':'')+'</div>';
+  return '<div class="card"><div class="label">'+label+'</div><div class="value '+(cls||'')+'\">'+value+'</div>'+(sub?'<div class="sub">'+sub+'</div>':'')+'</div>';
 }
 
 function setPeriod(p) { currentPeriod = p; render(); }
@@ -140,8 +199,9 @@ function renderChart(data) {
   const ctx = document.getElementById('mainChart');
   if (!ctx) return;
   const labels = data.map(d => d.timestamp ? d.timestamp.slice(11,16) : '');
-  const fmData = data.map(d => d.fmIndex || 50);
-  const mkData = data.map(d => d.marketNormalized || 100);
+  // null fmIndex must be kept as null so Chart.js renders a gap (spanGaps: false).
+  const fmData = data.map(d => d.fmIndex);
+  const mkData = data.map(d => d.marketNormalized != null ? d.marketNormalized : 100);
 
   if (chart) chart.destroy();
   chart = new Chart(ctx, {
@@ -149,8 +209,8 @@ function renderChart(data) {
     data: {
       labels: labels,
       datasets: [
-        { label: '펨코지수', data: fmData, borderColor: '#4488ff', backgroundColor: 'rgba(68,136,255,0.1)', yAxisID: 'y', tension: 0.3, fill: true },
-        { label: '코스피(정규화)', data: mkData, borderColor: '#ffaa00', backgroundColor: 'rgba(255,170,0,0.1)', yAxisID: 'y1', tension: 0.3, fill: false }
+        { label: '펨코지수', data: fmData, borderColor: '#4488ff', backgroundColor: 'rgba(68,136,255,0.1)', yAxisID: 'y', tension: 0.3, fill: true, spanGaps: false },
+        { label: '코스피(정규화)', data: mkData, borderColor: '#ffaa00', backgroundColor: 'rgba(255,170,0,0.1)', yAxisID: 'y1', tension: 0.3, fill: false, spanGaps: false }
       ]
     },
     options: {
@@ -160,7 +220,7 @@ function renderChart(data) {
         tooltip: { callbacks: {
           label: function(ctx) {
             const d = data[ctx.dataIndex];
-            let s = ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(2);
+            let s = ctx.dataset.label + ': ' + (ctx.parsed.y != null ? ctx.parsed.y.toFixed(2) : 'N/A');
             if (d && d.marketChangeRate != null) s += ' (코스피 ' + d.marketChangeRate.toFixed(2) + '%)';
             if (d && d.postCount != null) s += ' | 게시글 ' + d.postCount;
             return s;
@@ -219,7 +279,7 @@ def write_dashboard_files(
     return str(html_path)
 
 
-def serve_dashboard(directory: str, port: int = 8420) -> None:
+def serve_dashboard(directory: str, port: int = 8420, host: str = "127.0.0.1") -> None:
     """Serve the dashboard directory on localhost."""
     os.chdir(directory)
 
@@ -228,4 +288,4 @@ def serve_dashboard(directory: str, port: int = 8420) -> None:
             super().__init__(*args, directory=directory, **kwargs)
 
     print(f"FMIndex dashboard: http://localhost:{port}")
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    HTTPServer((host, port), Handler).serve_forever()

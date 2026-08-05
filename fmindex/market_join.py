@@ -11,18 +11,39 @@ from .fmindex_calc import HourlyFMIndex
 
 @dataclass
 class JoinedRecord:
-    """A single time bucket with both market and sentiment data."""
+    """A single time bucket with both market and sentiment data.
+
+    Internal field names are snake_case. The external JSON contract
+    (to_dict) uses camelCase keys (instrumentId, hasSentiment, dataMode).
+    """
 
     timestamp: str
     market: str
-    fmIndex: float
+    instrument_id: str
+    symbol: str
+    fmIndex: Optional[float]
+    has_sentiment: bool
     marketNormalized: float
     marketChangeRate: float
     postCount: int
     confidence: float
+    data_mode: str
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        """Serialize to the external camelCase JSON contract."""
+        return {
+            "timestamp": self.timestamp,
+            "market": self.market,
+            "instrumentId": self.instrument_id,
+            "symbol": self.symbol,
+            "fmIndex": self.fmIndex,
+            "hasSentiment": self.has_sentiment,
+            "marketNormalized": self.marketNormalized,
+            "marketChangeRate": self.marketChangeRate,
+            "postCount": self.postCount,
+            "confidence": self.confidence,
+            "dataMode": self.data_mode,
+        }
 
 
 @dataclass
@@ -78,19 +99,30 @@ class MarketSentimentJoiner:
             normalized = round((rec.close / base_close) * 100.0, 2)
 
             fm = fm_lookup.get(rec.timestamp)
-            fm_index = fm.fmIndex if fm else 50.0
-            post_count = fm.postCount if fm else 0
-            confidence = fm.confidence if fm else 0.0
+            if fm and fm.has_sentiment:
+                fm_index = fm.fmIndex
+                post_count = fm.postCount
+                confidence = fm.confidence
+                has_sentiment = True
+            else:
+                fm_index = None
+                post_count = 0
+                confidence = 0.0
+                has_sentiment = False
 
             results.append(
                 JoinedRecord(
                     timestamp=rec.timestamp,
                     market=market,
+                    instrument_id=rec.instrument_id,
+                    symbol=rec.symbol,
                     fmIndex=fm_index,
+                    has_sentiment=has_sentiment,
                     marketNormalized=normalized,
-                    marketChangeRate=rec.changeRate,
+                    marketChangeRate=rec.change_rate,
                     postCount=post_count,
                     confidence=confidence,
+                    data_mode=rec.data_mode,
                 )
             )
 
@@ -101,77 +133,19 @@ class MarketSentimentJoiner:
         overnight_indices: List[HourlyFMIndex],
         next_day_market: List[MarketRecord],
         trade_date: str = "",
-    ) -> Optional[OvernightEvaluation]:
+    ) -> OvernightEvaluation:
         """Evaluate overnight sentiment vs next-day market results.
 
-        Args:
-            overnight_indices: FM Index data from overnight hours.
-            next_day_market: Market data for the next trading day.
-            trade_date: The trade date being evaluated.
-
-        Returns:
-            OvernightEvaluation or None if insufficient data.
+        Since real session data is not yet available in this slice,
+        returns an unavailable status rather than computing inaccurate
+        overnight metrics from non-session data.
         """
-        if not overnight_indices or not next_day_market:
-            return None
-
-        # Overnight summary
-        fm_values = [fm.fmIndex for fm in overnight_indices]
-        avg_fm = round(sum(fm_values) / len(fm_values), 2) if fm_values else 50.0
-        min_fm = round(min(fm_values), 2) if fm_values else 50.0
-        last_fm = round(fm_values[-1], 2) if fm_values else 50.0
-
-        if avg_fm < 35:
-            signal = "negative"
-        elif avg_fm > 65:
-            signal = "positive"
-        else:
-            signal = "neutral"
-
-        # Next-day market metrics
-        if len(next_day_market) < 2:
-            return None
-
-        first = next_day_market[0]
-        first_hour = next_day_market[1] if len(next_day_market) > 1 else first
-        last = next_day_market[-1]
-        low_rec = min(next_day_market, key=lambda r: r.low)
-
-        base = first.open if first.open != 0 else 1.0
-
-        open_change = round(((first.close - base) / base) * 100, 2)
-        first_hour_change = round(
-            ((first_hour.close - first.close) / first.close) * 100, 2
-        ) if first.close != 0 else 0.0
-        low_change = round(((low_rec.low - base) / base) * 100, 2)
-        close_change = round(((last.close - base) / base) * 100, 2)
-
-        # Direction matching
-        def _matches(change: float, sig: str) -> bool:
-            if sig == "negative":
-                return change < 0
-            elif sig == "positive":
-                return change > 0
-            else:
-                return abs(change) < 0.5
-
         return OvernightEvaluation(
             tradeDate=trade_date,
             overnight={
-                "averageFmIndex": avg_fm,
-                "minimumFmIndex": min_fm,
-                "lastFmIndex": last_fm,
-                "signal": signal,
+                "status": "unavailable",
+                "reason": "real_session_data_not_available",
             },
-            kospi={
-                "openChangeRate": open_change,
-                "firstHourChangeRate": first_hour_change,
-                "lowChangeRate": low_change,
-                "closeChangeRate": close_change,
-            },
-            matches={
-                "open": _matches(open_change, signal),
-                "firstHour": _matches(first_hour_change, signal),
-                "close": _matches(close_change, signal),
-            },
+            kospi={},
+            matches={},
         )

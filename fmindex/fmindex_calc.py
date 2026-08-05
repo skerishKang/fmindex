@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -22,10 +22,15 @@ DIRECTION_SCORES = {
 
 @dataclass
 class HourlyFMIndex:
-    """FM Index for a single hour bucket."""
+    """FM Index for a single hour bucket.
+
+    Internal field names are snake_case. The external JSON contract
+    (to_dict) uses camelCase keys (fmIndex, hasSentiment, ...).
+    """
 
     timestamp: str
-    fmIndex: float
+    fmIndex: Optional[float]
+    has_sentiment: bool
     positiveRatio: float
     negativeRatio: float
     neutralRatio: float
@@ -36,7 +41,20 @@ class HourlyFMIndex:
     methodologyVersion: str
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        """Serialize to the external camelCase JSON contract."""
+        return {
+            "timestamp": self.timestamp,
+            "fmIndex": self.fmIndex,
+            "hasSentiment": self.has_sentiment,
+            "positiveRatio": self.positiveRatio,
+            "negativeRatio": self.negativeRatio,
+            "neutralRatio": self.neutralRatio,
+            "postCount": self.postCount,
+            "commentCount": self.commentCount,
+            "analyzedPostCount": self.analyzedPostCount,
+            "confidence": self.confidence,
+            "methodologyVersion": self.methodologyVersion,
+        }
 
 
 @dataclass
@@ -52,19 +70,14 @@ class FMIndexCalculator:
     """Calculates hourly FM Index from sentiment-analyzed posts.
 
     Groups posts by Asia/Seoul 1-hour buckets and computes:
-    - fmIndex: (averageScore + 1) * 50, range 0-100
+    - fmIndex: (averageScore + 1) * 50, range 0-100 (null if no sentiment)
+    - hasSentiment: whether sentiment data exists for this bucket
     - positiveRatio, negativeRatio, neutralRatio
     - postCount, commentCount, analyzedPostCount
     - confidence: weighted by sample size
     """
 
     def __init__(self, use_first_seen: bool = True):
-        """Initialize calculator.
-
-        Args:
-            use_first_seen: If True, use firstSeenAt for bucketing (prevents future leakage).
-                           If False, use publishedAt.
-        """
         self.use_first_seen = use_first_seen
 
     def calculate_hourly(
@@ -116,7 +129,8 @@ class FMIndexCalculator:
         if analyzed_posts == 0:
             return HourlyFMIndex(
                 timestamp=hour_key,
-                fmIndex=50.0,
+                fmIndex=None,
+                has_sentiment=False,
                 positiveRatio=0.0,
                 negativeRatio=0.0,
                 neutralRatio=0.0,
@@ -150,6 +164,7 @@ class FMIndexCalculator:
         return HourlyFMIndex(
             timestamp=hour_key,
             fmIndex=fm_index,
+            has_sentiment=True,
             positiveRatio=pos_ratio,
             negativeRatio=neg_ratio,
             neutralRatio=neu_ratio,
@@ -167,6 +182,8 @@ class FMIndexCalculator:
             dt = datetime.fromisoformat(ts_str)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=KST)
+            else:
+                dt = dt.astimezone(KST)
             dt = dt.replace(minute=0, second=0, microsecond=0)
             return dt.isoformat()
         except ValueError:

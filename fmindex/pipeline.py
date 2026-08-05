@@ -9,17 +9,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .market.bridge import MarketBridge, MarketRecord
 from .fmkorea.parser import FMKoreaParser, ParsedPost
-from .llm.provider import LLMProvider, SentimentResult, create_provider
-from .fmindex_calc import FMIndexCalculator, PostWithSentiment, HourlyFMIndex
-from .market_join import MarketSentimentJoiner, JoinedRecord, OvernightEvaluation
+from .llm.provider import LLMProvider, create_provider
+from .fmindex_calc import FMIndexCalculator, PostWithSentiment
+from .market_join import MarketSentimentJoiner
 from .dashboard.server import write_dashboard_files, serve_dashboard
 
 KST = timezone(timedelta(hours=9))
@@ -62,6 +60,7 @@ def run_pipeline_once(
                 "step": "market_bridge",
                 "status": "ok",
                 "records": len(market_records),
+                "rejectedNonIndex": getattr(bridge, "rejected_non_index", 0),
                 "source": market_data_path,
             })
         except FileNotFoundError as e:
@@ -77,6 +76,7 @@ def run_pipeline_once(
                 "step": "market_bridge",
                 "status": "ok",
                 "records": len(market_records),
+                "rejectedNonIndex": getattr(bridge, "rejected_non_index", 0),
                 "source": str(bridge.data_root),
             })
         except FileNotFoundError as e:
@@ -93,7 +93,7 @@ def run_pipeline_once(
             "step": "market_bridge",
             "status": "sample",
             "records": len(market_records),
-            "note": "Using sample market data (65stock data not found)",
+            "note": "Using sample market data (65stock data not found or only non-index instruments)",
         })
 
     # --- Step 2: FMKorea fixtures ---
@@ -170,16 +170,11 @@ def run_pipeline_once(
         "joined": len(joined),
     })
 
-    # --- Step 5b: Overnight evaluation (if enough data) ---
-    overnight = None
-    if len(fm_indices) >= 2 and len(market_records) >= 2:
-        overnight_eval = joiner.evaluate_overnight(
-            fm_indices[-2:],
-            market_records,
-            trade_date=datetime.now(KST).strftime("%Y-%m-%d"),
-        )
-        if overnight_eval:
-            overnight = overnight_eval.to_dict()
+    # --- Step 5b: Overnight evaluation (not computed from non-session data) ---
+    overnight = {
+        "status": "unavailable",
+        "reason": "real_session_data_not_available",
+    }
 
     # --- Step 6: Summary ---
     total_posts = len(posts)
@@ -190,6 +185,11 @@ def run_pipeline_once(
         if post_sentiments else 0.0
     )
 
+    provider_name = provider.__class__.__name__
+    instrument_id = getattr(market_records[0], "instrument_id", "") if market_records else ""
+    symbol = getattr(market_records[0], "symbol", "") if market_records else ""
+    data_mode = getattr(market_records[0], "data_mode", "sample") if market_records else "sample"
+
     summary = {
         "totalPosts": total_posts,
         "totalComments": total_comments,
@@ -197,6 +197,10 @@ def run_pipeline_once(
         "avgConfidence": round(avg_conf, 4),
         "fmIndexBuckets": len(fm_indices),
         "joinedRecords": len(joined),
+        "provider": provider_name,
+        "instrument": instrument_id,
+        "symbol": symbol,
+        "dataMode": data_mode,
     }
 
     # --- Step 7: Write output ---
@@ -256,13 +260,16 @@ def _generate_sample_market() -> List[MarketRecord]:
             MarketRecord(
                 timestamp=ts.isoformat(),
                 market="KOSPI",
+                instrument_id="KOSPI",
+                symbol="KOSPI",
                 open=round(open_p, 2),
                 high=round(high_p, 2),
                 low=round(low_p, 2),
                 close=round(close_p, 2),
-                changeRate=cr,
+                change_rate=cr,
                 source="sample-data",
-                observedAt=datetime.now(KST).isoformat(),
+                observed_at=datetime.now(KST).isoformat(),
+                data_mode="sample",
             )
         )
         base_price = close_p
