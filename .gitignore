@@ -2,6 +2,15 @@
 node_modules/
 .pnpm-store/
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Output directory (pipeline results, not committed)
+output/
+
 # Environment and secrets
 .env
 .env.*
