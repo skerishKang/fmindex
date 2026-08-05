@@ -1,0 +1,19 @@
+{
+  "name": "fmindex",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Local-first Korean retail investor sentiment research platform",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@11.4.0",
+  "engines": {
+    "node": ">=24 <25",
+    "pnpm": ">=11 <12"
+  },
+  "scripts": {
+    "bootstrap": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/bootstrap.ps1",
+    "doctor": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/doctor.ps1",
+    "check": "pnpm run doctor",
+    "dev": "node -e \"console.log('Phase 0: no application runtime has been implemented yet.')\"",
+    "test": "node -e \"console.log('Phase 0: no automated test suite has been implemented yet.')\""
+  }
+}
