@@ -51,6 +51,9 @@ class MarketRecord:
     source: str
     observed_at: str
     data_mode: str  # "real" | "sample" | "unsupported"
+    volume: Optional[float] = None
+    provider: str = ""
+    asset_type: str = "index"
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to the external camelCase JSON contract."""
@@ -59,12 +62,15 @@ class MarketRecord:
             "market": self.market,
             "instrumentId": self.instrument_id,
             "symbol": self.symbol,
+            "assetType": self.asset_type,
             "open": self.open,
             "high": self.high,
             "low": self.low,
             "close": self.close,
+            "volume": self.volume,
             "changeRate": self.change_rate,
             "source": self.source,
+            "provider": self.provider,
             "observedAt": self.observed_at,
             "dataMode": self.data_mode,
         }
@@ -178,6 +184,138 @@ class MarketBridge:
             candles.extend(result.get("candles", []))
 
         return self._aggregate_hourly(ticks, candles)
+
+    def read_kospi_records(self, filepath: str) -> List[MarketRecord]:
+        """Read a collector JSONL file and validate every record against the
+        real-KOSPI contract.
+
+        Each record must satisfy all of:
+        - provider == "kiwoom"
+        - assetType == "index"
+        - dataMode == "real"
+        - identity resolves to the KOSPI index (instrumentId/symbol)
+        - timestamp parses to a KST-aware hour bucket
+        - OHLC values are present and internally consistent
+        Records that fail validation are rejected (never used as real KOSPI).
+        Individual stock records are rejected, never merged into the index.
+        """
+        path = Path(filepath)
+        if not path.exists():
+            raise FileNotFoundError(f"Data file not found: {path}")
+
+        accepted: List[MarketRecord] = []
+        result = self._parse_jsonl_file(path)
+        candles = result.get("candles", [])
+        ticks = result.get("ticks", [])
+        for item in candles + ticks:
+            record = self._validate_kospi_record(item.raw)
+            if record is not None:
+                accepted.append(record)
+
+        # Deduplicate by (instrumentId, timestamp) — keep last.
+        seen: Dict[Tuple[str, str], MarketRecord] = {}
+        for record in accepted:
+            key = (record.instrument_id, record.timestamp)
+            seen[key] = record
+        deduped = list(seen.values())
+        deduped.sort(key=lambda r: r.timestamp)
+        return deduped
+
+    def _validate_kospi_record(
+        self, rec: Dict[str, Any]
+    ) -> Optional[MarketRecord]:
+        """Validate a single collector record against the real-KOSPI contract."""
+        provider = self._find_field(rec, ["provider", "source"])
+        if provider is None or str(provider).lower() != "kiwoom":
+            self.rejected_non_index += 1
+            return None
+
+        asset = self._find_field(rec, ["assetType", "asset_type", "securityType"])
+        if asset is None or str(asset).strip().lower() != "index":
+            self.rejected_non_index += 1
+            return None
+
+        mode = self._find_field(rec, ["dataMode", "data_mode"])
+        if mode is None or str(mode).strip().lower() != "real":
+            self.rejected_non_index += 1
+            return None
+
+        if not self._is_index_identity(
+            str(self._find_field(rec, ["instrumentId", "instrument_id"]) or ""),
+            str(self._find_field(rec, ["symbol", "종목명"]) or ""),
+            rec,
+        ):
+            self.rejected_non_index += 1
+            return None
+
+        ts = self._find_field(rec, ["timestamp", "time", "datetime"])
+        if ts is None:
+            self.rejected_non_index += 1
+            return None
+        ts_str = self._normalize_timestamp(str(ts))
+        if ts_str is None:
+            self.rejected_non_index += 1
+            return None
+
+        open_v = self._find_field(rec, ["open", "시가"])
+        high_v = self._find_field(rec, ["high", "고가"])
+        low_v = self._find_field(rec, ["low", "저가"])
+        close_v = self._find_field(rec, ["close", "종가", "cur_prc"])
+        if any(v is None for v in (open_v, high_v, low_v, close_v)):
+            self.rejected_non_index += 1
+            return None
+        try:
+            open_f, high_f, low_f, close_f = (
+                float(open_v), float(high_v), float(low_v), float(close_v)
+            )
+        except (ValueError, TypeError):
+            self.rejected_non_index += 1
+            return None
+
+        # OHLC internal consistency: high >= max(open, close), low <= min(...).
+        if high_f < max(open_f, close_f) or low_f > min(open_f, close_f):
+            self.rejected_non_index += 1
+            return None
+
+        volume_v = self._find_field(rec, ["volume", "거래량"])
+        volume = None
+        if volume_v is not None:
+            try:
+                volume = float(volume_v)
+            except (ValueError, TypeError):
+                volume = None
+
+        change_rate = 0.0
+        cr_v = self._find_field(rec, ["changeRate", "change_rate", "flu_rt"])
+        if cr_v is not None:
+            try:
+                change_rate = float(cr_v)
+            except (ValueError, TypeError):
+                change_rate = 0.0
+
+        return MarketRecord(
+            timestamp=ts_str,
+            market=self.market,
+            instrument_id=str(
+                self._find_field(rec, ["instrumentId", "instrument_id"]) or "001"
+            ),
+            symbol=str(
+                self._find_field(rec, ["symbol", "종목명"]) or "KOSPI"
+            ),
+            open=round(open_f, 4),
+            high=round(high_f, 4),
+            low=round(low_f, 4),
+            close=round(close_f, 4),
+            change_rate=change_rate,
+            source="kiwoom-rest-api",
+            observed_at=str(
+                self._find_field(rec, ["observedAt", "observed_at"]) or ts_str
+            ),
+            data_mode="real",
+            volume=volume,
+            provider="kiwoom",
+            asset_type="index",
+        )
 
     # ------------------------------------------------------------------ #
     # Parsing                                                             #

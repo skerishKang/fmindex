@@ -28,6 +28,7 @@ OUTPUT_DIR = Path(__file__).resolve().parents[1] / "output"
 
 def run_pipeline_once(
     market_data_path: Optional[str] = None,
+    market_source: str = "auto",
     fmkorea_fixture_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
     llm_provider: Optional[LLMProvider] = None,
@@ -53,15 +54,29 @@ def run_pipeline_once(
     bridge = MarketBridge()
     market_records: List[MarketRecord] = []
 
-    if market_data_path:
+    if market_source == "sample":
+        market_records = _generate_sample_market()
+        results["steps"].append({
+            "step": "market_bridge",
+            "status": "sample",
+            "records": len(market_records),
+            "note": "Explicit --market-source sample",
+        })
+    elif market_data_path:
         try:
-            market_records = bridge.read_records_from_path(market_data_path)
+            if market_source == "kiwoom":
+                # Strict real-KOSPI mode: validate the full contract and never
+                # silently fall back to sample data on failure.
+                market_records = bridge.read_kospi_records(market_data_path)
+            else:
+                market_records = bridge.read_records_from_path(market_data_path)
             results["steps"].append({
                 "step": "market_bridge",
                 "status": "ok",
                 "records": len(market_records),
                 "rejectedNonIndex": getattr(bridge, "rejected_non_index", 0),
                 "source": market_data_path,
+                "mode": market_source,
             })
         except FileNotFoundError as e:
             results["steps"].append({
@@ -86,15 +101,29 @@ def run_pipeline_once(
                 "error": str(e),
             })
 
-    # Fallback to sample data if no real data
-    if not market_records:
+    # Fallback to sample data only in auto mode (never in kiwoom mode).
+    if not market_records and market_source != "kiwoom":
         market_records = _generate_sample_market()
         results["steps"].append({
             "step": "market_bridge",
             "status": "sample",
             "records": len(market_records),
-            "note": "Using sample market data (65stock data not found or only non-index instruments)",
+            "note": "Using sample market data (real data not found)",
         })
+
+    if not market_records and market_source == "kiwoom":
+        # Fail closed: do NOT substitute sample data for a failed Kiwoom run.
+        results["steps"].append({
+            "step": "market_bridge",
+            "status": "unavailable",
+            "records": 0,
+            "note": "Kiwoom real mode requested but no validated KOSPI records; no sample fallback.",
+        })
+        results["marketUnavailable"] = True
+        raise RuntimeError(
+            "Kiwoom real mode requested but no validated KOSPI records were found. "
+            "Sample data was NOT substituted."
+        )
 
     # --- Step 2: FMKorea fixtures ---
     fixture_dir = Path(fmkorea_fixture_dir or FIXTURE_DIR)
@@ -201,6 +230,7 @@ def run_pipeline_once(
         "instrument": instrument_id,
         "symbol": symbol,
         "dataMode": data_mode,
+        "marketSource": market_source,
     }
 
     # --- Step 7: Write output ---
@@ -330,6 +360,14 @@ def main():
         help="Path to 65stock market data file (JSON or CSV)",
     )
     parser.add_argument(
+        "--market-source",
+        type=str,
+        default="auto",
+        choices=["auto", "sample", "kiwoom"],
+        help="Market data source: auto (real if available, else sample), "
+        "sample (explicit sample), kiwoom (real Kiwoom KOSPI only, fail-closed)",
+    )
+    parser.add_argument(
         "--fmkorea-dir",
         type=str,
         default=None,
@@ -357,6 +395,7 @@ def main():
         print("FMIndex pipeline: running once...")
         results = run_pipeline_once(
             market_data_path=args.market_data,
+            market_source=args.market_source,
             fmkorea_fixture_dir=args.fmkorea_dir,
             output_dir=args.output_dir,
         )
@@ -378,6 +417,7 @@ def main():
             print("Dashboard not found, running pipeline first...")
             run_pipeline_once(
                 market_data_path=args.market_data,
+                market_source=args.market_source,
                 fmkorea_fixture_dir=args.fmkorea_dir,
                 output_dir=args.output_dir,
             )
