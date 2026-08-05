@@ -42,13 +42,23 @@ from .models import (
     CollectionMetadata,
     HourlyIndexRecord,
 )
-from .market_calendar import KST, bucket_for_timestamp, is_trading_day
+from .market_calendar import (
+    CALENDAR_SOURCE,
+    CALENDAR_VERSION,
+    KST,
+    SUPPORTED_CALENDAR_YEARS,
+    bucket_for_timestamp,
+    is_trading_day,
+    validate_calendar_years,
+)
 from .kiwoom_auth import KiwoomAuthError, KiwoomTokenManager, credentials_available
 from .kiwoom_client import (
     API_CONTRACT_VERSION,
     KiwoomClient,
+    KiwoomPaginationError,
     KiwoomRateLimitError,
     KiwoomAPIError,
+    KiwoomResponse,
 )
 
 #: Official endpoint paths (confirmed contract).
@@ -73,6 +83,14 @@ DEFAULT_MAX_REQUESTS = 500
 
 #: Default overlap window (hours) re-fetched on incremental runs.
 DEFAULT_OVERLAP_HOURS = 8
+
+
+class NoTradingDaysError(RuntimeError):
+    """Raised when the requested range contains no supported trading days.
+
+    This is an explicit NO_TRADING_DAYS status: no output is fabricated
+    and the run is not reported as a successful real collection.
+    """
 
 
 class CollectorConfig:
@@ -133,9 +151,17 @@ class KospiCollector:
     # ------------------------------------------------------------------ #
 
     def collect_range(
-        self, from_date: str, to_date: str
+        self,
+        from_date: str,
+        to_date: str,
+        requested_dates: Optional[List[str]] = None,
     ) -> List[HourlyIndexRecord]:
-        """Backfill hourly KOSPI records for every trading day in range."""
+        """Backfill hourly KOSPI records for every trading day in range.
+
+        ``requested_dates`` (when provided) is appended with every date
+        actually fetched, so tests and metadata can assert the REAL
+        request plan rather than only the merged result.
+        """
         start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=KST)
         end = datetime.strptime(to_date, "%Y-%m-%d").replace(
             tzinfo=KST, hour=23, minute=59, second=59
@@ -149,6 +175,8 @@ class KospiCollector:
         day = start
         while day.date() <= end.date():
             if is_trading_day(day):
+                if requested_dates is not None:
+                    requested_dates.append(day.date().isoformat())
                 daily = self.collect_day(day.date())
                 for rec in daily:
                     key = (rec.provider, rec.instrument_id, rec.timestamp)
@@ -177,13 +205,16 @@ class KospiCollector:
         minute_pages = self._fetch_minute_pages(date_str)
         raw_candles = self._parse_minute_pages(minute_pages, date_str)
         for candle in raw_candles:
-            self.records_received += 1
             bucket = bucket_for_timestamp(candle.timestamp)
             if bucket is None:
+                # Out-of-session / invalid-time rows are rejected here.
                 self.records_rejected += 1
                 continue
-            buckets.setdefault(bucket[0].isoformat(), []).append(candle)
-            if bucket[1]:
+            key = bucket[0].isoformat()
+            is_new_bucket = key not in buckets
+            buckets.setdefault(key, []).append(candle)
+            # Count a partial bucket once, not once per constituent candle.
+            if bucket[1] and is_new_bucket:
                 self.partial_buckets += 1
 
         if not buckets and not (self.config and self.config.dry_run):
@@ -203,8 +234,13 @@ class KospiCollector:
     # Fetching                                                            #
     # ------------------------------------------------------------------ #
 
-    def _fetch_minute_pages(self, date_str: str) -> List[Dict[str, Any]]:
-        """Fetch ka20005 (업종분봉) pages for one date."""
+    def _fetch_minute_pages(self, date_str: str) -> List[KiwoomResponse]:
+        """Fetch ka20005 (업종분봉) pages for one date.
+
+        Fail-closed: KiwoomAuthError / KiwoomAPIError / KiwoomRateLimitError
+        / KiwoomPaginationError / transport timeout final failures are
+        propagated to the caller — never swallowed into an empty page set.
+        """
         if self.config and self.config.dry_run:
             return []
         self._check_request_budget()
@@ -214,29 +250,32 @@ class KospiCollector:
             "tic_scope": (self.config.tic_scope if self.config else "60"),
             "base_dt": date_str,
         }
-        try:
-            pages = self.client.fetch_all(API_ID_MINUTE_CHART, SECTOR_PATH, body)
-            self.requests_made += len(pages)
-            return pages
-        except KiwoomRateLimitError as e:
-            raise
-        except KiwoomAPIError as e:
-            self.warnings.append(f"ka20005 {date_str}: {e}")
-            return []
+        pages = self.client.fetch_all(API_ID_MINUTE_CHART, SECTOR_PATH, body)
+        self.requests_made += len(pages)
+        return pages
 
     def _parse_minute_pages(
-        self, pages: List[Dict[str, Any]], date_str: str
+        self, pages: List[KiwoomResponse], date_str: str
     ) -> List[Candle]:
-        """Parse ka20005 response tables into Candle records (KST)."""
+        """Parse ka20005 response tables into Candle records (KST).
+
+        Counting semantics (no double counting):
+        - records_received: every raw row received from the API
+        - records_rejected: rows rejected during parse/time/contract checks
+        - records_accepted: final hourly records (counted in collect_day)
+        """
         candles: List[Candle] = []
         for page in pages:
-            rows = page.get(TABLE_MINUTE, [])
+            rows = page.body.get(TABLE_MINUTE, [])
             if not isinstance(rows, list):
                 continue
             for row in rows:
+                self.records_received += 1
                 candle = self._candle_from_minute_row(row, date_str)
-                if candle is not None:
-                    candles.append(candle)
+                if candle is None:
+                    self.records_rejected += 1
+                    continue
+                candles.append(candle)
         return candles
 
     def _candle_from_minute_row(
@@ -254,8 +293,10 @@ class KospiCollector:
         if ts is None:
             return None
 
-        vol = self._float(row.get("trde_qty"))
-        volume = vol if vol is not None else self._float(row.get("acc_trde_qty"))
+        # Volume contract: only the per-candle trde_qty is used. acc_trde_qty
+        # is a CUMULATIVE total for the day — summing it across rows would
+        # fabricate volume, so it is never used as a per-candle volume.
+        volume = self._float(row.get("trde_qty"))
 
         bucket = bucket_for_timestamp(ts)
         is_partial = bool(bucket and bucket[1]) if bucket else False
@@ -287,8 +328,13 @@ class KospiCollector:
         low_p = min(c.low for c in sorted_c)
         close_p = sorted_c[-1].close
 
-        volumes = [c.volume for c in sorted_c if c.volume is not None]
-        volume = round(sum(volumes), 4) if volumes else None
+        # Volume policy: sum only when EVERY constituent candle carries a
+        # per-candle volume. If any candle lacks volume (e.g. trde_qty
+        # absent), the hourly volume is null — never a partial/fabricated sum.
+        if all(c.volume is not None for c in sorted_c):
+            volume = round(sum(c.volume for c in sorted_c), 4)  # type: ignore[arg-type]
+        else:
+            volume = None
 
         change_rate = 0.0
         if open_p != 0:
@@ -407,21 +453,36 @@ class KospiCollector:
         return records
 
     def write_records(self, path: Path, records: List[HourlyIndexRecord]) -> None:
-        """Write records as timestamp-sorted JSONL."""
+        """Write records as timestamp-sorted JSONL (atomic replace).
+
+        Data is written to a temporary sibling file first and atomically
+        moved over the target only on success, so a failed run never
+        truncates or corrupts an existing good output file.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            for rec in sorted(records, key=lambda r: r.timestamp):
-                f.write(json.dumps(rec.to_dict(), ensure_ascii=False) + "\n")
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                for rec in sorted(records, key=lambda r: r.timestamp):
+                    f.write(json.dumps(rec.to_dict(), ensure_ascii=False) + chr(10))
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
 
     def build_metadata(
         self,
         from_date: str,
         to_date: str,
         records: List[HourlyIndexRecord],
+        overlap_hours: int = 0,
+        existing_latest_timestamp: str = "",
+        effective_from: Optional[str] = None,
+        no_trading_days: bool = False,
     ) -> CollectionMetadata:
         """Build run metadata (never contains secrets)."""
-        effective_from = records[0].timestamp if records else from_date
-        effective_to = records[-1].timestamp if records else to_date
+        eff_from = effective_from or (records[0].timestamp if records else from_date)
+        eff_to = records[-1].timestamp if records else to_date
         latest = records[-1].timestamp if records else ""
         return CollectionMetadata(
             provider=PROVIDER,
@@ -430,8 +491,8 @@ class KospiCollector:
             asset_type=ASSET_TYPE_INDEX,
             requested_from=from_date,
             requested_to=to_date,
-            effective_from=effective_from,
-            effective_to=effective_to,
+            effective_from=eff_from,
+            effective_to=eff_to,
             requests_made=self.requests_made,
             records_received=self.records_received,
             records_accepted=self.records_accepted,
@@ -444,6 +505,12 @@ class KospiCollector:
             api_contract_version=API_CONTRACT_VERSION,
             collector_version=COLLECTOR_VERSION,
             warnings=list(self.warnings),
+            overlap_hours=overlap_hours,
+            existing_latest_timestamp=existing_latest_timestamp,
+            calendar_source=CALENDAR_SOURCE,
+            calendar_version=CALENDAR_VERSION,
+            supported_calendar_years=list(SUPPORTED_CALENDAR_YEARS),
+            no_trading_days=no_trading_days,
         )
 
     # ------------------------------------------------------------------ #
@@ -475,23 +542,21 @@ class KospiCollector:
         open) — a conservative fallback that never fabricates time.
         """
         tm = row.get("cntr_tm")
-        if tm:
-            text = str(tm).strip()
-            if len(text) == 4 and text.isdigit():
-                # HHMM -> HHMMSS (pad seconds on the right, never left).
-                text = text + "00"
-            if len(text) == 6 and text.isdigit():
-                hour, minute = int(text[:2]), int(text[2:4])
-                try:
-                    return datetime.strptime(
-                        f"{date_str} {hour:02d}:{minute:02d}", "%Y%m%d %H:%M"
-                    ).replace(tzinfo=KST).isoformat()
-                except ValueError:
-                    pass
+        if not tm:
+            return None
+        text = str(tm).strip()
+        if len(text) == 4 and text.isdigit():
+            # HHMM -> HHMMSS (pad seconds on the right, never left).
+            text = text + "00"
+        if len(text) != 6 or not text.isdigit():
+            return None
+        hour, minute = int(text[:2]), int(text[2:4])
+        if hour > 23 or minute > 59:
+            return None
         try:
-            return datetime.strptime(f"{date_str} 09:00", "%Y%m%d %H:%M").replace(
-                tzinfo=KST
-            ).isoformat()
+            return datetime.strptime(
+                f"{date_str} {hour:02d}:{minute:02d}", "%Y%m%d %H:%M"
+            ).replace(tzinfo=KST).isoformat()
         except ValueError:
             return None
 
@@ -527,32 +592,123 @@ def _record_from_dict(raw: Dict[str, Any]) -> HourlyIndexRecord:
 
 
 def run_collector(config: CollectorConfig) -> Dict[str, Any]:
-    """Run the collector CLI flow and return a summary dict."""
+    """Run the collector CLI flow and return a summary dict.
+
+    Fail-closed guarantees:
+    - The requested range must be within the supported calendar years.
+    - On API/auth/pagination errors nothing is written: existing output
+      files stay byte-identical (atomic writes) and no "successful real"
+      metadata is produced.
+    - A range with at least one trading day that yields zero accepted
+      records fails instead of emitting an empty/fake real series.
+    - A range with zero supported trading days raises ``NoTradingDaysError``
+      (explicit NO_TRADING_DAYS status; no fabricated output).
+    - Incremental runs re-fetch from ``max(requested_from,
+      latest_existing_timestamp - overlap_hours)`` so the overlap is
+      actually applied to the request plan, not just the merge.
+    """
     if not credentials_available():
         raise KiwoomAuthError(
             "Kiwoom credentials not configured (KIWOOM_APPKEY/KIWOOM_SECRETKEY). "
             "LIVE_SMOKE=SKIPPED_NO_CREDENTIALS"
         )
 
+    # Calendar year scope fails closed before any request is made.
+    validate_calendar_years(config.from_date, config.to_date)
+
     collector = KospiCollector(config=config, request_delay=config.request_delay)
 
     output_path = Path(config.output)
+    meta_path = Path(config.metadata_output)
     existing = collector.load_existing(output_path) if not config.force_refresh else []
 
-    fresh = collector.collect_range(config.from_date, config.to_date)
+    # --- Incremental overlap applied to the REQUEST plan ----------------- #
+    existing_latest = max((r.timestamp for r in existing), default="")
+    effective_from = config.from_date
+    if existing and not config.force_refresh and existing_latest:
+        latest_dt = datetime.fromisoformat(existing_latest)
+        overlap_start = latest_dt - timedelta(hours=config.overlap_hours)
+        requested_from_dt = datetime.strptime(
+            config.from_date, "%Y-%m-%d"
+        ).replace(tzinfo=KST)
+        to_dt_ = datetime.strptime(config.to_date, "%Y-%m-%d").replace(
+            tzinfo=KST
+        )
+        effective_dt = max(requested_from_dt, overlap_start)
+        if effective_dt.date() > to_dt_.date():
+            # Existing data already extends beyond the requested range:
+            # clamp to requested_to instead of misreporting NO_TRADING_DAYS.
+            effective_dt = to_dt_
+        effective_from = effective_dt.date().isoformat()
+
+    # Count supported trading days in the effective range (fail-closed).
+    from_dt = datetime.strptime(effective_from, "%Y-%m-%d").replace(tzinfo=KST)
+    to_dt = datetime.strptime(config.to_date, "%Y-%m-%d").replace(tzinfo=KST)
+    trading_days = sum(
+        1
+        for offset in range((to_dt.date() - from_dt.date()).days + 1)
+        if is_trading_day(from_dt + timedelta(days=offset))
+    )
+    if trading_days == 0:
+        if config.dry_run:
+            return {"dryRun": True, "status": "NO_TRADING_DAYS"}
+        raise NoTradingDaysError(
+            "NO_TRADING_DAYS: requested range "
+            f"{effective_from}..{config.to_date} contains no supported "
+            "trading days; no output was fabricated."
+        )
+
+    requested_dates: List[str] = []
+    fresh = collector.collect_range(
+        effective_from, config.to_date, requested_dates=requested_dates
+    )
     records = collector.merge_existing(existing, fresh)
 
+    if config.dry_run:
+        return {
+            "dryRun": True,
+            "requestedDates": requested_dates,
+            "recordsReceived": collector.records_received,
+            "recordsAccepted": collector.records_accepted,
+            "recordsRejected": collector.records_rejected,
+        }
+
+    # Zero accepted records on a range that has trading days -> fail closed.
+    # This holds regardless of any pre-existing data: a run that accepts
+    # nothing must never silently rewrite "real" metadata with stale rows.
+    if collector.records_accepted == 0 and trading_days > 0:
+        raise KiwoomAPIError(
+            "Collection failed closed: 0 records accepted across "
+            f"{trading_days} trading day(s). No output was written "
+            "(no sample substitution)."
+        )
+
     collector.write_records(output_path, records)
-    metadata = collector.build_metadata(config.from_date, config.to_date, records)
-    meta_path = Path(config.metadata_output)
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path.write_text(
-        json.dumps(metadata.to_dict(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    metadata = collector.build_metadata(
+        config.from_date,
+        config.to_date,
+        records,
+        overlap_hours=config.overlap_hours,
+        existing_latest_timestamp=existing_latest,
+        effective_from=effective_from,
     )
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_meta = meta_path.with_name(meta_path.name + ".tmp")
+    try:
+        tmp_meta.write_text(
+            json.dumps(metadata.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(tmp_meta, meta_path)
+    finally:
+        if tmp_meta.exists():
+            tmp_meta.unlink()
 
     return {
+        "status": "OK",
         "records": len(records),
+        "requestedDates": requested_dates,
+        "effectiveFrom": effective_from,
         "requestsMade": collector.requests_made,
         "recordsReceived": collector.records_received,
         "recordsAccepted": collector.records_accepted,
@@ -598,7 +754,13 @@ def main() -> None:
     )
     try:
         summary = run_collector(config)
-    except (KiwoomAuthError, KiwoomRateLimitError, KiwoomAPIError) as e:
+    except (
+        KiwoomAuthError,
+        KiwoomRateLimitError,
+        KiwoomAPIError,
+        KiwoomPaginationError,
+        NoTradingDaysError,
+    ) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
     print(json.dumps(summary, ensure_ascii=False, indent=2))

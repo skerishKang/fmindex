@@ -35,6 +35,18 @@ SESSION_CLOSE_MINUTE = 30
 CLOSING_AUCTION_HOUR = 15
 CLOSING_AUCTION_MINUTE = 20
 
+#: Calendar data source (fail-closed scope). The KRX official trading
+#: calendar is the source of truth; this module ships a validated 2026
+#: snapshot only. Requesting other years fails closed instead of guessing.
+CALENDAR_SOURCE = "krx-official-snapshot"
+
+#: Version of the holiday snapshot shipped in this module.
+CALENDAR_VERSION = "2026.1"
+
+#: Years this calendar snapshot supports. Ranges outside these years are
+#: rejected rather than guessed (no weekend-only heuristics).
+SUPPORTED_CALENDAR_YEARS = (2026,)
+
 #: Holiday snapshot: (year, month, day) tuples in KST.
 #:
 #: 2026 Korean public holidays (공휴일) per official government notice.
@@ -61,6 +73,35 @@ PUBLIC_HOLIDAYS: set[Tuple[int, int, int]] = {
     (2026, 10, 9),   # 한글날
     (2026, 12, 25),  # 성탄절
 }
+
+
+class CalendarYearError(ValueError):
+    """Raised when a requested date range includes an unsupported year."""
+
+
+def validate_calendar_years(from_date: str, to_date: str) -> None:
+    """Fail closed when the requested range includes unsupported years.
+
+    Args:
+        from_date, to_date: dates in YYYY-MM-DD format.
+
+    Raises:
+        CalendarYearError: when any year in the inclusive range is not in
+            ``SUPPORTED_CALENDAR_YEARS``.
+    """
+    years = set()
+    for d in (from_date, to_date):
+        try:
+            years.add(int(str(d)[:4]))
+        except (TypeError, ValueError):
+            raise CalendarYearError(f"Cannot parse calendar year from {d!r}.")
+    if not years <= set(SUPPORTED_CALENDAR_YEARS):
+        unsupported = sorted(years - set(SUPPORTED_CALENDAR_YEARS))
+        raise CalendarYearError(
+            "Calendar does not support year(s) "
+            f"{unsupported}; supported: {sorted(SUPPORTED_CALENDAR_YEARS)}. "
+            "Requesting other years fails closed (no weekend-only guessing)."
+        )
 
 
 def is_trading_day(dt: datetime) -> bool:

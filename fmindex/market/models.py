@@ -136,6 +136,12 @@ class CollectionMetadata:
     api_contract_version: str
     collector_version: str
     warnings: List[str] = field(default_factory=list)
+    overlap_hours: int = 0
+    existing_latest_timestamp: str = ""
+    calendar_source: str = ""
+    calendar_version: str = ""
+    supported_calendar_years: List[int] = field(default_factory=list)
+    no_trading_days: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to the metadata JSON contract (camelCase keys)."""
@@ -158,6 +164,12 @@ class CollectionMetadata:
             "data_mode": "dataMode",
             "api_contract_version": "apiContractVersion",
             "collector_version": "collectorVersion",
+            "overlap_hours": "overlapHours",
+            "existing_latest_timestamp": "existingLatestTimestamp",
+            "calendar_source": "calendarSource",
+            "calendar_version": "calendarVersion",
+            "supported_calendar_years": "supportedCalendarYears",
+            "no_trading_days": "noTradingDays",
         }
         result: Dict[str, Any] = {}
         for key, value in data.items():

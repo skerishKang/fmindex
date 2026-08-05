@@ -25,10 +25,13 @@ from fmindex.market.models import (
 )
 from fmindex.market.market_calendar import (
     KST,
+    CalendarYearError,
+    SUPPORTED_CALENDAR_YEARS,
     bucket_for_timestamp,
     is_session_time,
     is_trading_day,
     previous_trading_day,
+    validate_calendar_years,
 )
 from fmindex.market.kiwoom_auth import (
     KiwoomAuthError,
@@ -41,10 +44,12 @@ from fmindex.market.kiwoom_client import (
     KiwoomClient,
     KiwoomPaginationError,
     KiwoomRateLimitError,
+    KiwoomResponse,
 )
 from fmindex.market.kospi_collector import (
     CollectorConfig,
     KospiCollector,
+    NoTradingDaysError,
     run_collector,
 )
 from fmindex.market.bridge import MarketBridge, MarketRecord
@@ -124,7 +129,10 @@ class FakeTransport:
             raise KiwoomRateLimitError("simulated 429")
         if self.responses:
             return self.responses.pop(0)
-        return {"return_code": 0, "return_msg": "ok", "inds_min_pole_qry": []}
+        return KiwoomResponse(
+            body={"return_code": 0, "return_msg": "ok", "inds_min_pole_qry": []},
+            headers={},
+        )
 
 
 def make_client(transport=None, **kw):
@@ -146,14 +154,22 @@ def make_collector(transport=None, **kw):
     return KospiCollector(client=make_client(transport=transport), request_delay=0.0, **kw)
 
 
-def make_minute_page(rows, cont_yn="N", next_key=""):
-    return {
-        "return_code": 0,
-        "return_msg": "정상적으로 처리되었습니다",
-        "cont_yn": cont_yn,
-        "next_key": next_key,
-        "inds_min_pole_qry": rows,
-    }
+def make_minute_page(rows, cont_yn="N", next_key="", headers=None):
+    """Build a KiwoomResponse whose pagination values live ONLY in the
+    response headers (the official contract), never in the JSON body."""
+    hdrs = dict(headers or {})
+    if cont_yn:
+        hdrs.setdefault("cont-yn", cont_yn)
+    if next_key:
+        hdrs.setdefault("next-key", next_key)
+    return KiwoomResponse(
+        body={
+            "return_code": 0,
+            "return_msg": "정상적으로 처리되었습니다",
+            "inds_min_pole_qry": rows,
+        },
+        headers=hdrs,
+    )
 
 
 def minute_row(hhmm, o, h, l, c, vol="1000", acc_vol="10000"):
@@ -244,14 +260,56 @@ class TestInstrumentRejection:
 
 
 class TestAuthSecurity:
-    def test_secret_not_logged(self, monkeypatch, caplog):
-        """Credential values never appear in logs."""
+    def test_production_secret_not_logged(self, monkeypatch, caplog):
+        """PRODUCTION_SECRET_LOG_TEST: credentials never leak via the real
+        production path (KiwoomTokenManager._issue).
+
+        Unique sentinels are set as KIWOOM_APPKEY/KIWOOM_SECRETKEY; token
+        issuance is forced to fail over the network; caplog is at DEBUG
+        and a benign marker proves logs are actually being collected.
+        """
+        import logging
+        import urllib.error
+        import urllib.request
+
+        sentinel_app = "SENTINEL_APPKEY_9x2k"
+        sentinel_sec = "SENTINEL_SECRETKEY_7q4m"
+        monkeypatch.setenv("KIWOOM_APPKEY", sentinel_app)
+        monkeypatch.setenv("KIWOOM_SECRETKEY", sentinel_sec)
+        monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
+
+        caplog.set_level(logging.DEBUG)
+        logging.getLogger().setLevel(logging.DEBUG)
+        # Benign marker proves caplog actually captures records.
+        logging.getLogger("fmindex.test.marker").debug("benign-log-marker-1234")
+        assert "benign-log-marker-1234" in caplog.text
+
+        manager = KiwoomTokenManager(base_url="https://mockapi.kiwoom.com")
+
+        def boom(*args, **kwargs):
+            raise urllib.error.URLError("simulated connection refused")
+
+        monkeypatch.setattr(urllib.request, "urlopen", boom)
+        with pytest.raises(KiwoomAuthError) as excinfo:
+            manager.get_token()
+
+        combined = str(excinfo.value) + caplog.text
+        assert sentinel_app not in combined
+        assert sentinel_sec not in combined
+        assert "Bearer" not in combined
+
+    def test_authorization_header_not_logged(self, caplog):
+        """The Bearer token (test-token) never appears in logs."""
         import logging
 
-        logger = logging.getLogger("fmindex.test.secret")
-        logger.info("KIWOOM_APPKEY=super-secret-value and KIWOOM_SECRETKEY=another")
-        for record in caplog.records:
-            assert "super-secret-value" not in record.getMessage()
+        caplog.set_level(logging.DEBUG)
+        logging.getLogger().setLevel(logging.DEBUG)
+        transport = FakeTransport()
+        client = make_client(transport=transport)
+        client.fetch("ka20005", "/api/dostk/chart", {})
+        sent_token = transport.calls[0][2]["authorization"]
+        assert sent_token == "Bearer test-token"  # present in request by design
+        assert "test-token" not in caplog.text
 
     def test_credentials_available_no_values(self, monkeypatch):
         """credentials_available reports bool only, never values."""
@@ -299,20 +357,85 @@ class TestHttpClient:
     def test_return_code_5_rate_limit_stops(self):
         """return_code=5 in the envelope aborts as rate limit."""
         def transport(url, body, headers):
-            return {"return_code": 5, "return_msg": "허용된 요청 개수를 초과"}
+            return KiwoomResponse(
+                body={"return_code": 5, "return_msg": "허용된 요청 개수를 초과"},
+                headers={},
+            )
 
         client = make_client(transport=transport)
         with pytest.raises(KiwoomRateLimitError):
             client.fetch("ka20005", "/api/dostk/chart", {})
 
-    def test_pagination_terminates(self):
-        """Pagination stops when cont_yn != Y."""
-        pages = [
-            make_minute_page([minute_row("0905", 1, 2, 1, 2)], cont_yn="Y", next_key="k1"),
-            make_minute_page([minute_row("0910", 2, 3, 2, 3)], cont_yn="N"),
-        ]
-        client = make_client(transport=FakeTransport(responses=list(pages)))
+    def test_pagination_header_contract_two_pages(self):
+        """RESPONSE_HEADER_PAGINATION: cont-yn/next-key from headers.
 
+        The JSON body carries NO continuation values at all. The first
+        response header says cont-yn=Y/next-key=k1, the second says
+        cont-yn=N. The SECOND request must carry cont-yn=Y/next-key=k1.
+        Exactly two pages are returned.
+        """
+        body = {
+            "return_code": 0,
+            "return_msg": "ok",
+            "inds_min_pole_qry": [minute_row("0905", 1, 2, 1, 2)],
+        }
+        assert "cont_yn" not in body and "next_key" not in body
+        pages = [
+            KiwoomResponse(body=body, headers={"cont-yn": "Y", "next-key": "k1"}),
+            KiwoomResponse(
+                body={"return_code": 0, "return_msg": "ok", "inds_min_pole_qry": []},
+                headers={"cont-yn": "N"},
+            ),
+        ]
+        transport = FakeTransport(responses=list(pages))
+        client = make_client(transport=transport)
+
+        all_pages = client.fetch_all("ka20005", "/api/dostk/chart", {})
+        assert len(all_pages) == 2
+
+        # Second request reuses the previous response header values.
+        assert len(transport.calls) == 2
+        second_headers = transport.calls[1][2]
+        assert second_headers["cont-yn"] == "Y"
+        assert second_headers["next-key"] == "k1"
+        # First request starts with no continuation.
+        assert transport.calls[0][2]["cont-yn"] == "N"
+
+    def test_pagination_body_values_ignored(self):
+        """BODY_ONLY_PAGINATION_REMOVED: JSON-body cont_yn is NOT used."""
+        pages = [
+            KiwoomResponse(
+                body={
+                    "return_code": 0, "return_msg": "ok",
+                    "cont_yn": "Y", "next_key": "body-key",  # must be ignored
+                    "inds_min_pole_qry": [],
+                },
+                headers={},  # no continuation headers -> stop after 1 page
+            ),
+            KiwoomResponse(
+                body={"return_code": 0, "return_msg": "ok", "inds_min_pole_qry": []},
+                headers={},
+            ),
+        ]
+        transport = FakeTransport(responses=list(pages))
+        client = make_client(transport=transport)
+        all_pages = client.fetch_all("ka20005", "/api/dostk/chart", {})
+        assert len(all_pages) == 1  # header says stop; body value ignored
+
+    def test_pagination_header_case_insensitive(self):
+        """Uppercase response headers (Cont-Yn/Next-Key) are honored."""
+        pages = [
+            KiwoomResponse(
+                body={"return_code": 0, "return_msg": "ok", "inds_min_pole_qry": []},
+                headers={"Cont-Yn": "Y", "Next-Key": "k9"},
+            ),
+            KiwoomResponse(
+                body={"return_code": 0, "return_msg": "ok", "inds_min_pole_qry": []},
+                headers={"cont-yn": "N"},
+            ),
+        ]
+        transport = FakeTransport(responses=list(pages))
+        client = make_client(transport=transport)
         all_pages = client.fetch_all("ka20005", "/api/dostk/chart", {})
         assert len(all_pages) == 2
 
@@ -325,6 +448,19 @@ class TestHttpClient:
         client = make_client(transport=FakeTransport(responses=list(pages)))
 
         with pytest.raises(KiwoomPaginationError):
+            client.fetch_all("ka20005", "/api/dostk/chart", {})
+
+    def test_pagination_empty_key_with_cont_yn_y(self):
+        """cont-yn=Y with an empty next-key is a clear error."""
+        pages = [
+            KiwoomResponse(
+                body={"return_code": 0, "return_msg": "ok", "inds_min_pole_qry": []},
+                headers={"cont-yn": "Y", "next-key": ""},
+            ),
+        ]
+        client = make_client(transport=FakeTransport(responses=list(pages)))
+
+        with pytest.raises(KiwoomPaginationError, match="next-key header is empty"):
             client.fetch_all("ka20005", "/api/dostk/chart", {})
 
     def test_pagination_budget_cap(self):
@@ -587,7 +723,9 @@ class TestMetadata:
             "recordsReceived", "recordsAccepted", "recordsRejected",
             "duplicatesRemoved", "partialBuckets", "latestTimestamp",
             "generatedAt", "dataMode", "apiContractVersion", "collectorVersion",
-            "warnings",
+            "warnings", "overlapHours", "existingLatestTimestamp",
+            "calendarSource", "calendarVersion", "supportedCalendarYears",
+            "noTradingDays",
         }
         assert required <= set(meta.to_dict())
 
@@ -657,6 +795,51 @@ class TestPipelineModes:
 # --------------------------------------------------------------------------- #
 
 
+class TestExactKospiContract:
+    """EXACT_KOSPI_IDENTITY / OTHER_INDEX_REJECTED / MALFORMED_IDS_REJECTED."""
+
+    @staticmethod
+    def _bridge_rejects(tmp_path, **kw):
+        rec = make_record(**kw)
+        f = tmp_path / "bad.jsonl"
+        f.write_text(json.dumps(rec.to_dict(), ensure_ascii=False) + chr(10), encoding="utf-8")
+        return MarketBridge().read_kospi_records(str(f))
+
+    def test_exact_001_kospi_accepted(self):
+        assert MarketBridge.is_exact_kospi_contract("001", "KOSPI") is True
+
+    def test_kospi_index_identity_exact_only(self):
+        """is_exact_kospi_contract never does substring matching."""
+        assert MarketBridge.is_exact_kospi_contract("001", "KOSPI") is True
+        assert MarketBridge.is_exact_kospi_contract("0010", "KOSPI") is False
+        assert MarketBridge.is_exact_kospi_contract("001234", "KOSPI") is False
+        assert MarketBridge.is_exact_kospi_contract("001", "KOSDAQ") is False
+        assert MarketBridge.is_exact_kospi_contract("101", "KOSDAQ") is False
+        assert MarketBridge.is_exact_kospi_contract("1001", "KOSPI") is False
+        assert MarketBridge.is_exact_kospi_contract("005930", "KOSPI") is False
+
+    def test_bridge_rejects_kospi_with_wrong_symbol(self, tmp_path):
+        """instrumentId=001 but symbol=KOSDAQ is rejected."""
+        assert self._bridge_rejects(tmp_path, instrument_id="001", symbol="KOSDAQ") == []
+
+    def test_bridge_rejects_other_index(self, tmp_path):
+        """KOSDAQ index (101) with assetType=index is rejected."""
+        assert self._bridge_rejects(
+            tmp_path, instrument_id="101", symbol="KOSDAQ", asset_type="index"
+        ) == []
+
+    def test_bridge_rejects_malformed_ids(self, tmp_path):
+        """1001 / 001234 instrument ids are rejected."""
+        assert self._bridge_rejects(tmp_path, instrument_id="1001", symbol="KOSPI") == []
+        assert self._bridge_rejects(tmp_path, instrument_id="001234", symbol="KOSPI") == []
+
+    def test_bridge_rejects_stock_with_kospi_symbol(self, tmp_path):
+        """005930/KOSPI (individual stock mislabeled) is rejected."""
+        assert self._bridge_rejects(
+            tmp_path, instrument_id="005930", symbol="KOSPI", asset_type="stock"
+        ) == []
+
+
 class TestMarketBridgeReal:
     def test_market_bridge_real_kospi_pass(self, tmp_path):
         """Bridge accepts a validated real KOSPI record."""
@@ -723,3 +906,405 @@ class TestPipelineRealContract:
         config = CollectorConfig(from_date="2026-08-05", to_date="2026-08-05")
         with pytest.raises(KiwoomAuthError):
             run_collector(config)
+
+
+# --------------------------------------------------------------------------- #
+# MISSING_TIME_REJECTED / NO_TIMESTAMP_FABRICATION                             #
+# --------------------------------------------------------------------------- #
+
+
+class TestTimestampStrictRejection:
+    """cntr_tm is never fabricated; invalid/missing times are rejected."""
+
+    def _ts(self, tm):
+        collector = make_collector()
+        row = minute_row("0905", 100, 105, 99, 101)
+        row["cntr_tm"] = tm
+        return collector._timestamp_from_row(row, "20260805")
+
+    def test_missing_cntr_tm_rejected(self):
+        collector = make_collector()
+        row = minute_row("0905", 100, 105, 99, 101)
+        del row["cntr_tm"]
+        assert collector._timestamp_from_row(row, "20260805") is None
+
+    def test_empty_string_rejected(self):
+        assert self._ts("") is None
+
+    def test_hour_25_rejected(self):
+        assert self._ts("250000") is None
+
+    def test_minute_60_rejected(self):
+        assert self._ts("096000") is None
+
+    def test_non_numeric_rejected(self):
+        assert self._ts("abcdef") is None
+
+    def test_colon_time_rejected(self):
+        assert self._ts("08:59") is None
+        assert self._ts("15:30") is None
+
+    def test_valid_0900_accepted(self):
+        ts = self._ts("0900")
+        assert ts is not None
+        assert ts == "2026-08-05T09:00:00+09:00"
+
+    def test_valid_1529_accepted(self):
+        ts = self._ts("1529")
+        assert ts is not None
+        assert ts == "2026-08-05T15:29:00+09:00"
+
+    def test_no_0900_fabrication_on_missing_time(self):
+        """collect_day with only missing-time rows yields no records and
+        never fabricates a 09:00 bucket."""
+        row = minute_row("0905", 100, 105, 99, 101)
+        del row["cntr_tm"]
+        transport = FakeTransport(responses=[make_minute_page([row])])
+        collector = make_collector(transport=transport)
+        records = collector.collect_day("2026-08-05")
+        assert records == []
+        assert collector.records_received == 1
+        assert collector.records_rejected == 1
+        assert collector.records_accepted == 0
+
+
+# --------------------------------------------------------------------------- #
+# COLLECTOR_API_FAILS_CLOSED / FAILED_RUN_PRESERVES_OUTPUT                    #
+# --------------------------------------------------------------------------- #
+
+
+class TestCollectorFailClosed:
+    """API/auth/pagination failures never produce or clobber output."""
+
+    @staticmethod
+    def _env(monkeypatch):
+        monkeypatch.setenv("KIWOOM_APPKEY", "app")
+        monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
+        monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
+
+    def test_api_error_propagates_and_no_output(self, monkeypatch, tmp_path):
+        """Full run_collector path: API error -> no output, no metadata."""
+        import fmindex.market.kospi_collector as kc_mod
+        self._env(monkeypatch)
+        out = tmp_path / "out.jsonl"
+        config = CollectorConfig(
+            from_date="2026-08-03", to_date="2026-08-05",
+            output=str(out), metadata_output=str(tmp_path / "out.meta.json"),
+        )
+
+        def bad_transport(url, body, headers):
+            raise KiwoomAPIError("simulated API error")
+
+        collector = KospiCollector(client=make_client(transport=bad_transport), config=config, request_delay=0.0)
+        monkeypatch.setattr(kc_mod, "KospiCollector", lambda **kw: collector)
+
+        with pytest.raises(KiwoomAPIError):
+            run_collector(config)
+        assert not out.exists()
+        assert not (tmp_path / "out.meta.json").exists()
+
+    def test_existing_output_preserved_after_failure(self, monkeypatch, tmp_path):
+        """Full run_collector path: a failing run leaves existing files intact."""
+        import fmindex.market.kospi_collector as kc_mod
+        self._env(monkeypatch)
+        out = tmp_path / "out.jsonl"
+        out.write_text("KEEP-ME" + chr(10), encoding="utf-8")
+        config = CollectorConfig(
+            from_date="2026-08-03", to_date="2026-08-05",
+            output=str(out), metadata_output=str(tmp_path / "out.meta.json"),
+        )
+
+        def bad_transport(url, body, headers):
+            raise KiwoomPaginationError("simulated pagination error")
+
+        collector = KospiCollector(client=make_client(transport=bad_transport), config=config, request_delay=0.0)
+        monkeypatch.setattr(kc_mod, "KospiCollector", lambda **kw: collector)
+
+        with pytest.raises(KiwoomPaginationError):
+            run_collector(config)
+        assert out.read_text(encoding="utf-8") == "KEEP-ME" + chr(10)
+        assert not (tmp_path / "out.meta.json").exists()
+    def test_zero_records_on_trading_days_fails(self, monkeypatch, tmp_path):
+        """Trading days present but 0 rows accepted -> fail closed (no output)."""
+        import fmindex.market.kospi_collector as kc_mod
+        self._env(monkeypatch)
+        out = tmp_path / "out.jsonl"
+        config = CollectorConfig(
+            from_date="2026-08-03", to_date="2026-08-05",
+            output=str(out), metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=make_client(transport=FakeTransport()), config=config, request_delay=0.0)
+        monkeypatch.setattr(kc_mod, "KospiCollector", lambda **kw: collector)
+
+        with pytest.raises(KiwoomAPIError, match="0 records accepted"):
+            run_collector(config)
+        assert collector.records_accepted == 0
+        assert not out.exists()
+        assert not (tmp_path / "out.meta.json").exists()
+
+    def test_no_trading_days_raises(self, monkeypatch, tmp_path):
+        """A holiday-only/weekend-only range is an explicit NO_TRADING_DAYS."""
+        self._env(monkeypatch)
+        config = CollectorConfig(
+            from_date="2026-08-15", to_date="2026-08-16",  # Sat+Sun (광복절 Sat)
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        with pytest.raises(NoTradingDaysError, match="NO_TRADING_DAYS"):
+            run_collector(config)
+        assert not (tmp_path / "out.jsonl").exists()
+        assert not (tmp_path / "out.meta.json").exists()
+
+    def test_weekday_holiday_only_range_no_trading_days(self, monkeypatch, tmp_path):
+        """2026-08-17 (Mon, 광복절 대체공휴일) alone is NO_TRADING_DAYS."""
+        self._env(monkeypatch)
+        config = CollectorConfig(
+            from_date="2026-08-17", to_date="2026-08-17",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        with pytest.raises(NoTradingDaysError, match="NO_TRADING_DAYS"):
+            run_collector(config)
+
+
+# --------------------------------------------------------------------------- #
+# INCREMENTAL_FETCH_PLAN / OVERLAP_APPLIED_TO_REQUESTS                         #
+# --------------------------------------------------------------------------- #
+
+
+def _ok_transport(url, body, headers):
+    """Return a valid single-row page for every request."""
+    return make_minute_page([minute_row("0905", 100, 105, 99, 101)])
+
+
+class TestIncrementalFetchPlan:
+    """The overlap window is applied to the actual request plan."""
+
+    @staticmethod
+    def _env(monkeypatch):
+        monkeypatch.setenv("KIWOOM_APPKEY", "app")
+        monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
+        monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
+
+    def _run_and_capture(self, monkeypatch, tmp_path, config, existing):
+        self._env(monkeypatch)
+        out = tmp_path / "out.jsonl"
+        if existing:
+            out.write_text(kospi_jsonl_lines(existing), encoding="utf-8")
+        collector = KospiCollector(
+            client=make_client(transport=_ok_transport), config=config, request_delay=0.0
+        )
+        captured = {}
+        orig = collector.collect_range
+
+        def spy(*args, **kwargs):
+            captured["from"] = args[0]
+            captured["to"] = args[1]
+            return orig(*args, **kwargs)
+
+        collector.collect_range = spy
+        import fmindex.market.kospi_collector as kc_mod
+        monkeypatch.setattr(kc_mod, "KospiCollector", lambda **kw: collector)
+        summary = run_collector(config)
+        return summary, captured
+
+    def test_overlap_applied_to_request_plan(self, monkeypatch, tmp_path):
+        """existing latest 08-05 14:00 KST, overlap 8h, requested from 08-01
+        -> effective re-fetch starts 08-05 (same trading day)."""
+        config = CollectorConfig(
+            from_date="2026-08-01", to_date="2026-08-06",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+            overlap_hours=8,
+        )
+        existing = [make_record(ts="2026-08-05T14:00:00+09:00")]
+        summary, captured = self._run_and_capture(monkeypatch, tmp_path, config, existing)
+        assert captured["from"] == "2026-08-05"
+        assert captured["to"] == "2026-08-06"
+        assert "2026-08-05" in summary["requestedDates"]
+        assert "2026-08-04" not in summary["requestedDates"]
+
+    def test_overlap_spans_previous_day(self, monkeypatch, tmp_path):
+        """overlap crossing into the previous trading day is fetched."""
+        config = CollectorConfig(
+            from_date="2026-08-01", to_date="2026-08-05",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+            overlap_hours=24,
+        )
+        existing = [make_record(ts="2026-08-05T09:00:00+09:00")]
+        summary, captured = self._run_and_capture(monkeypatch, tmp_path, config, existing)
+        assert captured["from"] == "2026-08-04"
+        assert "2026-08-04" in summary["requestedDates"]
+        assert "2026-08-05" in summary["requestedDates"]
+
+    def test_no_existing_file_full_range(self, monkeypatch, tmp_path):
+        """No existing data -> request from requested_from."""
+        config = CollectorConfig(
+            from_date="2026-08-04", to_date="2026-08-05",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+            overlap_hours=8,
+        )
+        summary, captured = self._run_and_capture(monkeypatch, tmp_path, config, [])
+        assert captured["from"] == "2026-08-04"
+        assert summary["requestedDates"] == ["2026-08-04", "2026-08-05"]
+
+    def test_force_refresh_full_range(self, monkeypatch, tmp_path):
+        """force_refresh=True re-fetches from requested_from."""
+        config = CollectorConfig(
+            from_date="2026-08-01", to_date="2026-08-03",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+            overlap_hours=8,
+            force_refresh=True,
+        )
+        existing = [make_record(ts="2026-08-03T14:00:00+09:00")]
+        summary, captured = self._run_and_capture(monkeypatch, tmp_path, config, existing)
+        assert captured["from"] == "2026-08-01"
+
+    def test_metadata_records_overlap_plan(self, monkeypatch, tmp_path):
+        """Metadata records effectiveFrom/overlapHours/existingLatest."""
+        config = CollectorConfig(
+            from_date="2026-08-01", to_date="2026-08-06",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+            overlap_hours=8,
+        )
+        existing = [make_record(ts="2026-08-05T14:00:00+09:00")]
+        self._run_and_capture(monkeypatch, tmp_path, config, existing)
+        meta = json.loads(Path(tmp_path / "out.meta.json").read_text(encoding="utf-8"))
+        assert meta["effectiveFrom"] == "2026-08-05"
+        assert meta["overlapHours"] == 8
+        assert meta["existingLatestTimestamp"] == "2026-08-05T14:00:00+09:00"
+
+    def test_weekend_skipped_in_request_plan(self, monkeypatch, tmp_path):
+        """Weekends are never in the actual requested dates."""
+        config = CollectorConfig(
+            from_date="2026-08-06", to_date="2026-08-10",  # Thu..Mon
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        summary, _ = self._run_and_capture(monkeypatch, tmp_path, config, [])
+        assert summary["requestedDates"] == ["2026-08-06", "2026-08-07", "2026-08-10"]
+
+
+# --------------------------------------------------------------------------- #
+# VOLUME_POLICY: trde_qty only, cumulative never summed                       #
+# --------------------------------------------------------------------------- #
+
+
+
+
+    def test_existing_latest_after_requested_to_clamped(self, monkeypatch, tmp_path):
+        """Existing data beyond requested_to clamps effective start to
+        requested_to (never a bogus NO_TRADING_DAYS misreport)."""
+        config = CollectorConfig(
+            from_date="2026-08-01", to_date="2026-08-06",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+            overlap_hours=8,
+        )
+        existing = [make_record(ts="2026-08-10T14:00:00+09:00")]
+        summary, captured = self._run_and_capture(monkeypatch, tmp_path, config, existing)
+        assert captured["from"] == "2026-08-06"  # clamped to requested_to
+        assert captured["to"] == "2026-08-06"
+        assert summary["requestedDates"] == ["2026-08-06"]
+        assert summary["status"] == "OK"
+class TestVolumeContract:
+    """Hourly volume sums per-candle trde_qty; null when any candle lacks it."""
+
+    def _collector(self, transport):
+        return KospiCollector(client=make_client(transport=transport), request_delay=0.0)
+
+    def test_sum_all_present(self):
+        rows = [
+            minute_row("0905", 100, 105, 99, 101, vol="100"),
+            minute_row("0925", 101, 110, 100, 108, vol="200"),
+            minute_row("0945", 108, 109, 102, 104, vol="150"),
+        ]
+        collector = self._collector(FakeTransport(responses=[make_minute_page(rows)]))
+        records = collector.collect_day("2026-08-05")
+        assert records[0].volume == 450.0
+
+    def test_all_missing_with_cumulative_present_is_null(self):
+        """trde_qty absent everywhere (acc_trde_qty present) -> null, not a sum."""
+        rows = [
+            minute_row("0905", 100, 105, 99, 101, vol=None, acc_vol="1000"),
+            minute_row("0925", 101, 110, 100, 108, vol=None, acc_vol="1200"),
+            minute_row("0945", 108, 109, 102, 104, vol=None, acc_vol="1500"),
+        ]
+        collector = self._collector(FakeTransport(responses=[make_minute_page(rows)]))
+        records = collector.collect_day("2026-08-05")
+        assert records[0].volume is None
+
+    def test_cumulative_not_summed(self):
+        """CUMULATIVE_VOLUME_NOT_SUMMED: 1000/1200/1500 never becomes 3700."""
+        rows = [
+            minute_row("0905", 100, 105, 99, 101, vol=None, acc_vol="1000"),
+            minute_row("0925", 101, 110, 100, 108, vol=None, acc_vol="1200"),
+            minute_row("0945", 108, 109, 102, 104, vol=None, acc_vol="1500"),
+        ]
+        collector = self._collector(FakeTransport(responses=[make_minute_page(rows)]))
+        records = collector.collect_day("2026-08-05")
+        assert records[0].volume != 3700.0
+        assert records[0].volume is None
+
+    def test_partial_missing_volume_is_null(self):
+        """One candle missing volume -> the hourly bucket is null (policy)."""
+        rows = [
+            minute_row("0905", 100, 105, 99, 101, vol="100"),
+            minute_row("0925", 101, 110, 100, 108, vol=None, acc_vol="1200"),
+            minute_row("0945", 108, 109, 102, 104, vol="150"),
+        ]
+        collector = self._collector(FakeTransport(responses=[make_minute_page(rows)]))
+        records = collector.collect_day("2026-08-05")
+        assert records[0].volume is None
+
+
+# --------------------------------------------------------------------------- #
+# CALENDAR_SCOPE_FAILS_CLOSED / WEEKDAY_HOLIDAY_TEST                          #
+# --------------------------------------------------------------------------- #
+
+
+class TestCalendarScope:
+    """The calendar supports only 2026; other years fail closed."""
+
+    def test_weekday_holiday_excluded(self):
+        """2026-03-02 (Mon, 삼일절 대체공휴일) is not a trading day."""
+        dt = datetime(2026, 3, 2, 10, 0, tzinfo=KST)
+        assert dt.weekday() == 0  # Monday
+        assert is_trading_day(dt) is False
+
+    def test_regular_weekday_included(self):
+        dt = datetime(2026, 8, 5, 10, 0, tzinfo=KST)
+        assert is_trading_day(dt) is True
+
+    def test_supported_year_ok(self):
+        validate_calendar_years("2026-01-01", "2026-12-31")
+
+    def test_unsupported_year_fails_closed(self):
+        with pytest.raises(CalendarYearError, match="does not support year"):
+            validate_calendar_years("2025-08-01", "2025-08-05")
+        with pytest.raises(CalendarYearError):
+            validate_calendar_years("2026-12-31", "2027-01-02")
+
+    def test_run_collector_rejects_unsupported_year(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("KIWOOM_APPKEY", "app")
+        monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
+        monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
+        config = CollectorConfig(
+            from_date="2027-01-02", to_date="2027-01-03",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        with pytest.raises(CalendarYearError):
+            run_collector(config)
+        assert not (tmp_path / "out.jsonl").exists()
+
+    def test_holiday_excluded_weekday_not_weekend_only(self):
+        """HOLIDAY_EXCLUDED is verified on a WEEKDAY holiday, not only
+        2026-08-15 which is a Saturday anyway."""
+        assert is_trading_day(datetime(2026, 5, 25, 10, 0, tzinfo=KST)) is False  # 부처님오신날 Mon
+        assert is_trading_day(datetime(2026, 10, 9, 10, 0, tzinfo=KST)) is False  # 한글날 Fri
+        assert is_trading_day(datetime(2026, 10, 8, 10, 0, tzinfo=KST)) is True   # Thu before

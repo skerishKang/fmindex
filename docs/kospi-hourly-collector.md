@@ -167,3 +167,93 @@ The dashboard UI files are not modified by this work.
 - 60-minute buckets are produced from `tic_scope="60"`; minute-level
   aggregation (tic_scope < 60) is implemented and covered by tests but not
   exercised against the live API.
+
+---
+
+## Offline contract alignment (PR #8 fix)
+
+### Pagination uses response headers
+
+Kiwoom's official continuation contract lives in the **response headers**
+(`cont-yn` / `next-key`), not in the JSON body. The client returns a
+`KiwoomResponse` (body + headers) from every request; `fetch_all` reads
+`cont-yn`/`next-key` from the headers only and forwards them verbatim into
+the next request's headers. JSON-body `cont_yn`/`next_key` values are never
+used as the official continuation values. Header names are matched
+case-insensitively. A `cont-yn=Y` header with an empty `next-key` is a
+pagination error (infinite-loop guard), repeated keys abort, and
+`max_pages` bounds the loop.
+
+### Exact KOSPI identity
+
+A real-KOSPI record must satisfy the exact contract, with **no substring
+matching**:
+
+- provider = `kiwoom`
+- assetType = `index`
+- dataMode = `real`
+- instrumentId = `001` (종합/KOSPI)
+- symbol = `KOSPI`
+
+Rejected: `101`/KOSDAQ, `1001`, `001234`, `001` with symbol KOSDAQ,
+`005930` labeled KOSPI, or any other index identity. The generic 65stock
+bridge (`_is_index_identity`) is unchanged for legacy files; the strict
+check applies only on the `read_kospi_records` / collector path.
+
+### Strict time parsing (no fabrication)
+
+`cntr_tm` (HHMM or HHMMSS, KST) is the only time source. Missing,
+non-numeric, wrong-length, `HH>23`, `MM>59` values are rejected. A missing
+`cntr_tm` is **never** replaced with a fabricated 09:00 timestamp.
+Out-of-session timestamps are rejected by the bucket rules.
+
+Counting semantics (no double counting):
+
+- `recordsReceived` — raw rows received from the API
+- `recordsRejected` — rows rejected during parse/time/session/contract checks
+- `recordsAccepted` — final hourly records
+
+### Volume policy
+
+Only the per-candle `trde_qty` is used. `acc_trde_qty` is a cumulative
+daily total and is **never summed** across rows. The hourly bucket volume
+is the sum of per-candle volumes only when every constituent candle has
+one; otherwise it is `null` (never a partial/fabricated sum).
+
+### Fail-closed behavior
+
+- API/auth/rate-limit/pagination/timeout failures propagate; nothing is
+  written and existing output files stay byte-identical.
+- Output (JSONL and metadata) is written to a temp file and atomically
+  replaced on success only.
+- A range with trading days that yields 0 accepted records fails
+  (no empty/fake real series, no sample substitution).
+- A range with zero supported trading days raises `NO_TRADING_DAYS`;
+  no output is fabricated.
+
+### Incremental overlap applies to the request plan
+
+On incremental runs (`force_refresh=false` with existing data) the
+re-fetch starts at:
+
+```
+effective_start = max(requested_from, latest_existing_timestamp - overlap_hours)
+```
+
+and every trading day from `effective_start` (inclusive) to `requested_to`
+is requested. Metadata records `requestedFrom`, `requestedTo`,
+`effectiveFrom`, `effectiveTo`, `overlapHours`, and
+`existingLatestTimestamp`.
+
+### Calendar scope
+
+`SUPPORTED_CALENDAR_YEARS = (2026,)`. Ranges containing unsupported years
+raise `CalendarYearError` before any request is made (fail closed, no
+weekend-only guessing). Metadata records `calendarSource`,
+`calendarVersion`, and `supportedCalendarYears`. Weekday public holidays
+are verified (e.g. 2026-03-02 삼일절 대체공휴일).
+
+### Known limitations (unchanged)
+
+- Live API smoke test not yet run: `LIVE_SMOKE=SKIPPED_NO_CREDENTIALS`.
+  Set `KIWOOM_APPKEY`/`KIWOOM_SECRETKEY` to enable.

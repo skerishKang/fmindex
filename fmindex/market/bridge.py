@@ -189,11 +189,13 @@ class MarketBridge:
         """Read a collector JSONL file and validate every record against the
         real-KOSPI contract.
 
-        Each record must satisfy all of:
+        Each record must satisfy the EXACT KOSPI contract:
         - provider == "kiwoom"
         - assetType == "index"
         - dataMode == "real"
-        - identity resolves to the KOSPI index (instrumentId/symbol)
+        - instrumentId == "001" and symbol == "KOSPI" (exact, no
+          substring matching; other indexes like KOSDAQ/1001/001234
+          and stocks like 005930 are rejected)
         - timestamp parses to a KST-aware hour bucket
         - OHLC values are present and internally consistent
         Records that fail validation are rejected (never used as real KOSPI).
@@ -240,11 +242,11 @@ class MarketBridge:
             self.rejected_non_index += 1
             return None
 
-        if not self._is_index_identity(
-            str(self._find_field(rec, ["instrumentId", "instrument_id"]) or ""),
-            str(self._find_field(rec, ["symbol", "종목명"]) or ""),
-            rec,
-        ):
+        instrument_id = str(
+            self._find_field(rec, ["instrumentId", "instrument_id"]) or ""
+        )
+        symbol = str(self._find_field(rec, ["symbol", "종목명"]) or "")
+        if not self.is_exact_kospi_contract(instrument_id, symbol):
             self.rejected_non_index += 1
             return None
 
@@ -296,12 +298,8 @@ class MarketBridge:
         return MarketRecord(
             timestamp=ts_str,
             market=self.market,
-            instrument_id=str(
-                self._find_field(rec, ["instrumentId", "instrument_id"]) or "001"
-            ),
-            symbol=str(
-                self._find_field(rec, ["symbol", "종목명"]) or "KOSPI"
-            ),
+            instrument_id=instrument_id,
+            symbol=symbol,
             open=round(open_f, 4),
             high=round(high_f, 4),
             low=round(low_f, 4),
@@ -594,6 +592,17 @@ class MarketBridge:
             )
 
         return records
+
+    @staticmethod
+    def is_exact_kospi_contract(instrument_id: str, symbol: str) -> bool:
+        """Whether a record identity is EXACTLY the real KOSPI index.
+
+        The real-KOSPI contract is strict: instrumentId must be exactly
+        "001" and symbol must be exactly "KOSPI". No substring matching
+        is performed, so other indexes (KOSDAQ, 1001, 001234, ...) and
+        individual stocks (005930, ...) are always rejected here.
+        """
+        return instrument_id.strip() == "001" and symbol.strip().upper() == "KOSPI"
 
     def _is_index_identity(
         self,

@@ -5,7 +5,9 @@ Implements the official request contract:
 - Headers: ``api-id``, ``authorization: Bearer <token>``,
   ``cont-yn``, ``next-key``, ``Content-Type: application/json;charset=UTF-8``
 - Body: JSON payload with request parameters
-- Pagination: response ``cont_yn == "Y"`` plus ``next_key`` to continue
+- Pagination: response *headers* ``cont-yn == "Y"`` plus ``next-key``
+  to continue (the official contract carries these in response
+  headers, not in the JSON body)
 - Rate limit: per-TR sustained ~1 req/s, burst 2 (measured; HTTP 429 /
   ``return_code == 5`` means the limit was exceeded)
 
@@ -19,6 +21,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from .kiwoom_auth import KiwoomTokenManager
@@ -46,8 +49,30 @@ class KiwoomPaginationError(RuntimeError):
     """Raised when pagination does not terminate."""
 
 
-#: Transport signature: (url, body_dict, headers) -> response_dict.
-Transport = Callable[[str, Dict[str, Any], Dict[str, str]], Dict[str, Any]]
+@dataclass(frozen=True)
+class KiwoomResponse:
+    """A Kiwoom API response: JSON body plus the HTTP response headers.
+
+    Pagination continuation values (``cont-yn`` / ``next-key``) live in
+    the response *headers* per the official contract, never in the JSON
+    body. Headers are normalized to lowercase at construction time so
+    lookups are case-insensitive.
+    """
+
+    body: Dict[str, Any]
+    headers: Dict[str, str]
+
+    def header(self, name: str) -> str:
+        """Case-insensitive header lookup; returns "" when absent."""
+        wanted = name.lower()
+        for key, value in self.headers.items():
+            if key.lower() == wanted:
+                return value
+        return ""
+
+
+#: Transport signature: (url, body_dict, headers) -> KiwoomResponse.
+Transport = Callable[[str, Dict[str, Any], Dict[str, str]], KiwoomResponse]
 
 
 def default_transport(
@@ -55,15 +80,24 @@ def default_transport(
     body: Dict[str, Any],
     headers: Dict[str, str],
     timeout: float = 15.0,
-) -> Dict[str, Any]:
-    """Default urllib-based transport for the Kiwoom REST API."""
+) -> KiwoomResponse:
+    """Default urllib-based transport for the Kiwoom REST API.
+
+    Parses the JSON body and collects the HTTP response headers
+    (normalized to lowercase) so pagination values in the response
+    headers are never lost.
+    """
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload, headers=headers, method="POST"
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            resp_headers = {
+                str(k).lower(): str(v) for k, v in resp.headers.items()
+            }
+            body_data = json.loads(resp.read().decode("utf-8"))
+            return KiwoomResponse(body=body_data, headers=resp_headers)
     except urllib.error.HTTPError as e:
         if e.code == 429:
             raise KiwoomRateLimitError(
@@ -118,8 +152,12 @@ class KiwoomClient:
         body: Optional[Dict[str, Any]] = None,
         cont_yn: str = "N",
         next_key: str = "",
-    ) -> Dict[str, Any]:
-        """Issue a single POST request and validate the response envelope."""
+    ) -> KiwoomResponse:
+        """Issue a single POST request and validate the response envelope.
+
+        Returns a ``KiwoomResponse`` carrying both the JSON body and the
+        HTTP response headers (pagination values are read from headers).
+        """
         self._throttle()
         token = self.token_manager.get_token()
         headers = {
@@ -135,10 +173,10 @@ class KiwoomClient:
         last_error: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
-                data = self._transport(url, body, headers)
+                response = self._transport(url, body, headers)
                 self.requests_made += 1
-                self._validate_envelope(data, api_id)
-                return data
+                self._validate_envelope(response.body, api_id)
+                return response
             except KiwoomRateLimitError:
                 raise
             except KiwoomAPIError:
@@ -165,7 +203,7 @@ class KiwoomClient:
             KiwoomPaginationError: when pagination exceeds ``max_pages``
                 or returns the same next_key twice (infinite-loop guard).
         """
-        pages: List[Dict[str, Any]] = []
+        pages: List[KiwoomResponse] = []
         cont_yn, next_key = "N", ""
         seen_keys: set = set()
 
@@ -173,10 +211,17 @@ class KiwoomClient:
             page = self.fetch(api_id, path, body, cont_yn=cont_yn, next_key=next_key)
             pages.append(page)
 
-            page_cont = page.get("cont_yn", "N")
-            page_key = page.get("next_key", "")
-            if page_cont != "Y":
+            # Pagination values come from the RESPONSE HEADERS per the
+            # official contract (cont-yn / next-key), not the JSON body.
+            page_cont = page.header("cont-yn") or "N"
+            page_key = page.header("next-key") or ""
+            if page_cont.strip().upper() != "Y":
                 break
+            if not page_key.strip():
+                raise KiwoomPaginationError(
+                    "cont-yn=Y but next-key header is empty; aborting "
+                    "pagination (infinite-loop guard)."
+                )
             if page_key in seen_keys:
                 raise KiwoomPaginationError(
                     f"Pagination repeated next_key {page_key!r}; aborting."
