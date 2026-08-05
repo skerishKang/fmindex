@@ -140,6 +140,18 @@
     return normalizeMarket(joined || []);
   }
 
+  // 기간 필터를 통과한 source를 기준으로 차트 시리즈를 구성한다.
+  // 시장선도 펨코지수와 동일한 기간 필터(built.source)를 통과해야 시간축이 정렬된다.
+  function buildChartSeries(joined, period, market) {
+    var built = buildChartData(joined, period);
+    return {
+      labels: built.labels,
+      fmData: built.fmData,
+      marketData: marketSeriesFor(built.source, market),
+      source: built.source
+    };
+  }
+
   function buildChartData(joined, period) {
     var filtered = filterByPeriod(joined, period);
     var labels = filtered.map(function (d) { return d.timestamp ? d.timestamp.slice(0, 16) : ''; });
@@ -470,10 +482,10 @@
       function renderChart() {
         var ctx = document.getElementById('mainChart');
         if (!ctx || typeof Chart === 'undefined') return;
-        var built = buildChartData(data.joined || [], settings.period);
+        var built = buildChartSeries(data.joined || [], settings.period, settings.market);
         var labels = built.labels;
         var fmData = built.fmData;
-        var marketData = marketSeriesFor(data.joined || [], settings.market);
+        var marketData = built.marketData;
 
         var fmColor = cssVar('--fm') || '#6a4dff';
         var marketColor = cssVar('--market') || '#e8930c';
@@ -679,6 +691,7 @@
     filterByPeriod: filterByPeriod,
     normalizeMarket: normalizeMarket,
     marketSeriesFor: marketSeriesFor,
+    buildChartSeries: buildChartSeries,
     buildChartData: buildChartData,
     buildDivergence: buildDivergence,
     sentimentLabel: sentimentLabel,

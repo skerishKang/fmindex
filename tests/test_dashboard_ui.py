@@ -585,3 +585,38 @@ class TestIntegratedContracts:
         assert "templates/*.html" in pyproject
         assert "static/css/*.css" in pyproject
         assert "static/js/*.js" in pyproject
+
+
+# --------------------------------------------------------------------------- #
+# CHART_SERIES_ALIGNMENT_PASS (final chart alignment fix)
+# --------------------------------------------------------------------------- #
+
+
+class TestChartSeriesAlignment:
+    def test_chart_series_alignment_24h(self):
+        """Market series must use the same period-filtered source as the FM line."""
+        latest = datetime(2026, 8, 5, 12, 0, tzinfo=KST)
+        rows = [
+            {"timestamp": latest.isoformat(), "fmIndex": 55.0, "marketNormalized": 100.5},
+            {"timestamp": (latest - timedelta(hours=1)).isoformat(), "fmIndex": 54.0, "marketNormalized": 100.3},
+            {"timestamp": (latest - timedelta(hours=23)).isoformat(), "fmIndex": 53.0, "marketNormalized": 100.1},
+            {"timestamp": (latest - timedelta(hours=25)).isoformat(), "fmIndex": 52.0, "marketNormalized": 99.9},
+            {"timestamp": (latest - timedelta(days=8)).isoformat(), "fmIndex": 51.0, "marketNormalized": 99.0},
+        ]
+        old_25h = rows[3]["timestamp"]
+        old_8d = rows[4]["timestamp"]
+
+        k = js_json(f"ui.buildChartSeries({json.dumps(rows)}, '24h', 'KOSPI')")
+        src = k["source"]
+        src_ts = [r["timestamp"] for r in src]
+        assert len(src) == 3
+        assert old_25h not in src_ts
+        assert old_8d not in src_ts
+        assert len(k["labels"]) == len(k["fmData"]) == len(k["marketData"]) == len(src)
+        assert k["fmData"] == [55.0, 54.0, 53.0]
+        assert all(isinstance(v, (int, float)) for v in k["marketData"])
+
+        n = js_json(f"ui.buildChartSeries({json.dumps(rows)}, '24h', 'NASDAQ')")
+        assert len(n["labels"]) == len(n["marketData"]) == len(n["source"]) == 3
+        assert all(v is None for v in n["marketData"])
+        assert n["fmData"] == [55.0, 54.0, 53.0]
