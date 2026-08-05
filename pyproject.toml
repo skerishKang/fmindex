@@ -14,5 +14,12 @@ dev = ["pytest"]
 [tool.setuptools.packages.find]
 include = ["fmindex*"]
 
+[tool.setuptools.package-data]
+"fmindex.dashboard" = [
+  "templates/*.html",
+  "static/css/*.css",
+  "static/js/*.js",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
