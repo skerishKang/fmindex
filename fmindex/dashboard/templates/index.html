@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ko" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>FM INDEX · 펨코지수</title>
+  <link rel="stylesheet" href="/assets/css/dashboard.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+  <script src="/assets/js/dashboard.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">본문으로 바로가기</a>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="#today" aria-label="FM INDEX 오늘 화면">
+        <span class="brand-mark" aria-hidden="true">FM</span>
+        <span class="brand-copy">
+          <strong>FM INDEX</strong>
+          <small>펨코지수</small>
+        </span>
+      </a>
+
+      <nav class="primary-nav" aria-label="주요 메뉴">
+        <button class="nav-item is-active" type="button" data-section="today">오늘</button>
+        <button class="nav-item" type="button" data-section="correlation">연관성</button>
+        <button class="nav-item" type="button" data-section="history">기록</button>
+        <button class="nav-item" type="button" data-section="methodology">방법론</button>
+        <button class="nav-item" type="button" data-section="status">데이터 상태</button>
+      </nav>
+
+      <div class="header-actions">
+        <span id="headerModeBadge" class="status-badge status-badge--sample">SAMPLE DATA</span>
+        <button id="themeToggle" class="icon-button" type="button" aria-label="다크 모드로 전환" aria-pressed="false">
+          <span class="icon-button__sun" aria-hidden="true">☀</span>
+          <span class="icon-button__moon" aria-hidden="true">☾</span>
+        </button>
+        <button id="settingsToggle" class="icon-button" type="button" aria-label="차트 색상 설정 열기" aria-expanded="false">⚙</button>
+      </div>
+    </div>
+  </header>
+
+  <aside id="settingsPanel" class="settings-panel" aria-label="화면 설정" hidden>
+    <div class="settings-panel__header">
+      <div>
+        <strong>화면 설정</strong>
+        <p>상승·하락 색상 규칙을 선택합니다.</p>
+      </div>
+      <button id="settingsClose" class="plain-button" type="button">닫기</button>
+    </div>
+    <fieldset>
+      <legend>시장 색상</legend>
+      <label class="radio-row"><input type="radio" name="colorMode" value="kr" checked> 한국식 <span>상승 빨강 · 하락 파랑</span></label>
+      <label class="radio-row"><input type="radio" name="colorMode" value="us"> 미국식 <span>상승 초록 · 하락 빨강</span></label>
+      <label class="radio-row"><input type="radio" name="colorMode" value="custom"> 사용자 지정</label>
+    </fieldset>
+    <div id="customColorFields" class="custom-colors" hidden>
+      <label>상승색 <input id="riseColor" type="color" value="#d84a4a"></label>
+      <label>하락색 <input id="fallColor" type="color" value="#356ac3"></label>
+    </div>
+  </aside>
+
+  <main id="main" class="page-shell">
+    <section id="today" class="page-section is-active" aria-labelledby="todayTitle">
+      <div class="page-heading">
+        <div>
+          <p class="eyebrow">커뮤니티 심리 × 시장 흐름</p>
+          <h1 id="todayTitle">오늘의 펨코지수</h1>
+        </div>
+        <div class="updated-block">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span>마지막 갱신</span>
+          <strong id="lastUpdated">—</strong>
+        </div>
+      </div>
+
+      <section class="hero-grid" aria-label="핵심 지수와 시장 차트">
+        <article class="index-card">
+          <div class="index-card__topline">
+            <span class="index-card__label">현재 펨코지수</span>
+            <span id="sentimentStateBadge" class="tone-badge tone-badge--neutral">데이터 대기</span>
+          </div>
+          <div class="index-card__value-row">
+            <strong id="currentFmIndex" class="index-card__value">—</strong>
+            <span class="index-card__unit">/ 100</span>
+          </div>
+          <div class="index-card__change">
+            <span>최근 1시간</span>
+            <strong id="hourlyChange">—</strong>
+          </div>
+          <dl class="index-card__meta">
+            <div><dt>분석 글</dt><dd id="postCount">0개</dd></div>
+            <div><dt>신뢰도</dt><dd id="confidenceValue">—</dd></div>
+            <div><dt>분석 모델</dt><dd id="providerValue">—</dd></div>
+          </dl>
+          <div class="sample-notice" id="sampleNotice">
+            <strong>샘플 데이터</strong>
+            <p>현재 화면은 UI와 데이터 계약 검증용입니다. 실제 투자 판단에 사용할 수 없습니다.</p>
+          </div>
+        </article>
+
+        <article class="chart-card">
+          <div class="chart-card__header">
+            <div class="segmented-control" role="group" aria-label="시장 선택">
+              <button type="button" class="segment is-active" data-market="KOSPI">코스피</button>
+              <button type="button" class="segment" data-market="NASDAQ">나스닥</button>
+            </div>
+            <div class="chart-legend" aria-label="차트 범례">
+              <span><i class="legend-line legend-line--fm"></i>펨코지수</span>
+              <span><i class="legend-line legend-line--market"></i><b id="marketLegendLabel">코스피</b> 정규화</span>
+            </div>
+          </div>
+
+          <div class="chart-toolbar">
+            <div class="segmented-control segmented-control--small" role="group" aria-label="기간 선택">
+              <button type="button" class="segment is-active" data-period="24h">24시간</button>
+              <button type="button" class="segment" data-period="7d">7일</button>
+              <button type="button" class="segment" data-period="30d">30일</button>
+              <button type="button" class="segment" data-period="all">전체</button>
+            </div>
+            <div class="segmented-control segmented-control--small" role="group" aria-label="관계 보기">
+              <button type="button" class="segment is-active" data-view="companion">동행</button>
+              <button type="button" class="segment" data-view="lead">선행</button>
+              <button type="button" class="segment" data-view="divergence">괴리</button>
+            </div>
+          </div>
+
+          <div id="chartStatus" class="chart-status" role="status" aria-live="polite"></div>
+          <div class="chart-wrap">
+            <canvas id="mainChart" aria-label="펨코지수와 시장지수 비교 차트" role="img"></canvas>
+          </div>
+          <div class="session-strip" aria-label="시장 시간대">
+            <span class="session-strip__kr">국내장</span>
+            <span class="session-strip__after">장 마감 후</span>
+            <span class="session-strip__us">미국장</span>
+            <span class="session-strip__pre">다음 국내장 전</span>
+          </div>
+        </article>
+      </section>
+
+      <article class="insight-card" aria-labelledby="insightTitle">
+        <div class="insight-card__icon" aria-hidden="true">i</div>
+        <div>
+          <p class="eyebrow">오늘의 해석</p>
+          <h2 id="insightTitle">데이터를 불러오는 중입니다.</h2>
+          <p id="insightBody">현재 펨코지수와 시장 흐름의 관계를 확인합니다.</p>
+        </div>
+      </article>
+
+      <section class="metric-grid" aria-label="사후 방향 일치도">
+        <article class="metric-card"><span>다음 시가 방향 일치율</span><strong>—</strong><small>데이터 축적 중 · 유효 표본 0건</small></article>
+        <article class="metric-card"><span>장초 1시간 방향 일치율</span><strong>—</strong><small>데이터 축적 중 · 유효 표본 0건</small></article>
+        <article class="metric-card"><span>당일 종가 방향 일치율</span><strong>—</strong><small>데이터 축적 중 · 유효 표본 0건</small></article>
+        <article class="metric-card"><span>평균 선행 시간</span><strong>—</strong><small>데이터 축적 중 · 유효 표본 0건</small></article>
+      </section>
+
+      <section class="analysis-grid">
+        <article id="sessionPanel" class="panel-card panel-card--wide">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow" id="sessionEyebrow">국내시장</p>
+              <h2 id="sessionTitle">야간 심리와 다음 국내장</h2>
+            </div>
+            <span id="sessionStatusBadge" class="status-badge status-badge--muted">연동 전</span>
+          </div>
+          <div class="session-summary">
+            <div class="session-summary__main">
+              <strong id="sessionPrimary">실제 세션 데이터가 아직 없습니다.</strong>
+              <p id="sessionDescription">국내장 마감 이후 심리, 야간선물, 다음 날 시가·장초·종가를 순서대로 연결할 예정입니다.</p>
+            </div>
+            <div class="session-steps" aria-label="세션 분석 단계">
+              <div><span>심리</span><strong>—</strong></div>
+              <div><span id="sessionMiddleLabel">야간선물</span><strong>—</strong></div>
+              <div><span>개장</span><strong>—</strong></div>
+              <div><span>종가</span><strong>—</strong></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel-card">
+          <div class="panel-heading"><div><p class="eyebrow">최근 기록</p><h2>야간·주간 심리 결과</h2></div></div>
+          <div class="empty-state"><strong>기록 데이터가 없습니다.</strong><p>실제 거래일 데이터가 쌓이면 최근 결과를 표시합니다.</p></div>
+        </article>
+
+        <article class="panel-card">
+          <div class="panel-heading"><div><p class="eyebrow">관계 분석</p><h2>주요 괴리 사례</h2></div></div>
+          <div class="empty-state"><strong>괴리 사례를 계산 중입니다.</strong><p>유효 표본이 확보되면 상위 사례를 표시합니다.</p></div>
+        </article>
+
+        <article class="panel-card">
+          <div class="panel-heading"><div><p class="eyebrow">커뮤니티 맥락</p><h2>분위기를 움직인 주제</h2></div></div>
+          <div class="empty-state"><strong>주제 데이터가 없습니다.</strong><p>실제 LLM 분석 연결 후 핵심 주제를 표시합니다.</p></div>
+        </article>
+
+        <article class="panel-card">
+          <div class="panel-heading"><div><p class="eyebrow">시스템</p><h2>데이터 상태</h2></div></div>
+          <dl class="status-list">
+            <div><dt>시장</dt><dd id="statusMarket">KOSPI</dd></div>
+            <div><dt>데이터 모드</dt><dd id="statusDataMode">sample</dd></div>
+            <div><dt>시장 소스</dt><dd id="statusSource">—</dd></div>
+            <div><dt>심리 데이터</dt><dd id="statusSentiment">—</dd></div>
+            <div><dt>방법론</dt><dd id="statusMethodology">fmindex-v1</dd></div>
+          </dl>
+        </article>
+      </section>
+    </section>
+
+    <section id="correlation" class="page-section" aria-labelledby="correlationTitle" hidden>
+      <div class="subpage-card"><p class="eyebrow">분석</p><h1 id="correlationTitle">연관성</h1><p>동시간·1시간 후·다음 시가·장초·종가 방향 일치도를 표본 수와 함께 제공할 예정입니다.</p><div class="empty-state"><strong>실데이터 계산 준비 중</strong><p>가짜 백분율 대신 유효한 시장·심리 데이터가 확보된 뒤 공개합니다.</p></div></div>
+    </section>
+
+    <section id="history" class="page-section" aria-labelledby="historyTitle" hidden>
+      <div class="subpage-card"><p class="eyebrow">아카이브</p><h1 id="historyTitle">기록</h1><p>날짜별 야간·주간 심리와 다음 시장 결과를 보관합니다.</p><div class="empty-state"><strong>아직 기록이 없습니다.</strong><p>실제 수집이 시작되면 거래일별 평가가 누적됩니다.</p></div></div>
+    </section>
+
+    <section id="methodology" class="page-section" aria-labelledby="methodologyTitle" hidden>
+      <div class="subpage-card methodology-copy"><p class="eyebrow">투명성</p><h1 id="methodologyTitle">방법론</h1><h2>지수 산식</h2><p>긍정은 +1, 중립·혼합은 0, 부정은 -1로 집계하고 시간대 평균을 0~100 범위로 변환합니다. 관련 없는 게시물은 집계에서 제외합니다.</p><h2>시간 기준</h2><p>미래 데이터 누출을 막기 위해 기본 분석에는 게시물의 최초 관측 시각을 사용합니다.</p><h2>한계</h2><p>현재는 오프라인 Fixture와 결정론적 Mock 분석을 이용한 구조 검증 단계입니다. 본 서비스는 투자 권유나 수익 보장을 제공하지 않습니다.</p></div>
+    </section>
+
+    <section id="status" class="page-section" aria-labelledby="statusTitle" hidden>
+      <div class="subpage-card"><p class="eyebrow">운영</p><h1 id="statusTitle">데이터 상태</h1><dl class="status-list status-list--large"><div><dt>선택 시장</dt><dd id="detailMarket">KOSPI</dd></div><div><dt>데이터 모드</dt><dd id="detailDataMode">sample</dd></div><div><dt>마지막 갱신</dt><dd id="detailUpdated">—</dd></div><div><dt>LLM Provider</dt><dd id="detailProvider">—</dd></div><div><dt>야간 평가</dt><dd id="detailOvernight">unavailable</dd></div></dl></div>
+    </section>
+  </main>
+
+  <nav class="mobile-nav" aria-label="모바일 메뉴">
+    <button type="button" class="is-active" data-section="today">오늘</button>
+    <button type="button" data-section="correlation">연관성</button>
+    <button type="button" data-section="history">기록</button>
+    <button type="button" data-section="methodology">방법론</button>
+  </nav>
+</body>
+</html>
