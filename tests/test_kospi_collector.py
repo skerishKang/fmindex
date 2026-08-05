@@ -879,6 +879,196 @@ class TestMarketBridgeReal:
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# TIC_SCOPE_CANONICAL_INT / REQUEST_BODY_TIC_SCOPE_INT / INVALID_SCOPE_FAIL_FAST
+# --------------------------------------------------------------------------- #
+
+
+class TestTicScopeCanonicalContract:
+    """Canonical tic_scope contract: int everywhere, fail-fast on invalid."""
+
+    def test_default_value_is_int(self):
+        cfg = CollectorConfig(from_date="2026-08-05", to_date="2026-08-05")
+        assert cfg.tic_scope == 60
+        assert type(cfg.tic_scope) is int
+
+    def test_numeric_input_is_int(self):
+        cfg = CollectorConfig(from_date="2026-08-05", to_date="2026-08-05", tic_scope=60)
+        assert cfg.tic_scope == 60
+        assert type(cfg.tic_scope) is int
+
+    def test_compatible_string_input_canonicalized_to_int(self):
+        cfg = CollectorConfig(from_date="2026-08-05", to_date="2026-08-05", tic_scope="60")
+        assert cfg.tic_scope == 60
+        assert type(cfg.tic_scope) is int
+
+    def test_all_allowed_scopes_are_int(self):
+        from fmindex.market.kospi_collector import ALLOWED_TIC_SCOPES
+        for scope in ALLOWED_TIC_SCOPES:
+            cfg = CollectorConfig(
+                from_date="2026-08-05", to_date="2026-08-05", tic_scope=scope
+            )
+            assert type(cfg.tic_scope) is int
+            assert cfg.tic_scope == scope
+
+    @pytest.mark.parametrize(
+        "bad",
+        [0, 2, 59, 90, "abc", "05", None, True, False, 60.0, "60.0"],
+    )
+    def test_invalid_scope_fails_fast(self, bad):
+        with pytest.raises(ValueError):
+            CollectorConfig(from_date="2026-08-05", to_date="2026-08-05", tic_scope=bad)
+
+    def test_request_body_tic_scope_is_int(self, tmp_path):
+        """The body seen by the transport must carry int tic_scope."""
+        seen = {}
+
+        def transport(url, body, headers):
+            seen["body"] = body
+            return make_minute_page(
+                [minute_row("0900", 3200, 3210, 3190, 3205)], cont_yn="N"
+            )
+
+        cfg = CollectorConfig(
+            from_date="2026-08-05",
+            to_date="2026-08-05",
+            tic_scope=60,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
+        fresh = collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
+        assert fresh is not None
+        assert "tic_scope" in seen["body"]
+        assert seen["body"]["tic_scope"] == 60
+        assert type(seen["body"]["tic_scope"]) is int
+
+    def test_all_allowed_scopes_sent_as_int(self, tmp_path):
+        from fmindex.market.kospi_collector import ALLOWED_TIC_SCOPES
+        for scope in ALLOWED_TIC_SCOPES:
+            seen = {}
+
+            def transport(url, body, headers):
+                seen["body"] = body
+                return make_minute_page(
+                    [minute_row("0900", 3200, 3210, 3190, 3205)], cont_yn="N"
+                )
+
+            cfg = CollectorConfig(
+                from_date="2026-08-05",
+                to_date="2026-08-05",
+                tic_scope=scope,
+                output=str(tmp_path / f"out-{scope}.jsonl"),
+                metadata_output=str(tmp_path / f"out-{scope}.meta.json"),
+            )
+            collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
+            collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
+            assert type(seen["body"]["tic_scope"]) is int
+            assert seen["body"]["tic_scope"] == scope
+
+    def test_live_error_mock_rejects_string_tic_scope(self, tmp_path):
+        """Reproduce the live API failure: a string tic_scope must fail."""
+        seen = {}
+
+        def strict_transport(url, body, headers):
+            seen["body"] = body
+            if type(body.get("tic_scope")) is not int:
+                raise KiwoomAPIError(
+                    "Kiwoom API error [ka20005] return_code=2: "
+                    "파라미터=tic_scope 실패사유= 타입 불일치"
+                )
+            return make_minute_page(
+                [minute_row("0900", 3200, 3210, 3190, 3205)], cont_yn="N"
+            )
+
+        cfg = CollectorConfig(
+            from_date="2026-08-05",
+            to_date="2026-08-05",
+            tic_scope="60",  # string input canonicalized to int
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        assert type(cfg.tic_scope) is int
+        collector = KospiCollector(client=make_client(transport=strict_transport), config=cfg, request_delay=0.0)
+        collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
+        assert type(seen["body"]["tic_scope"]) is int
+
+    def test_body_serialization_is_number(self, tmp_path):
+        """json.dumps of the request body must emit tic_scope as a number."""
+        import json as _json
+        seen = {}
+
+        def transport(url, body, headers):
+            seen["body"] = body
+            return make_minute_page(
+                [minute_row("0900", 3200, 3210, 3190, 3205)], cont_yn="N"
+            )
+
+        cfg = CollectorConfig(
+            from_date="2026-08-05",
+            to_date="2026-08-05",
+            tic_scope=60,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=make_client(transport=transport), config=cfg, request_delay=0.0)
+        collector.collect_range("2026-08-05", "2026-08-05", requested_dates=[])
+        serialized = _json.dumps(seen["body"])
+        assert '"tic_scope": 60' in serialized
+        assert '"tic_scope": "60"' not in serialized
+
+    def test_cli_parses_tic_scope_as_int(self):
+        from fmindex.market.kospi_collector import build_parser
+        parser = build_parser()
+        args = parser.parse_args(
+            ["--from", "2026-08-05", "--to", "2026-08-05", "--tic-scope", "60"]
+        )
+        assert type(args.tic_scope) is int
+        assert args.tic_scope == 60
+
+    def test_cli_rejects_invalid_tic_scope(self):
+        from fmindex.market.kospi_collector import build_parser
+        parser = build_parser()
+        import pytest as _pytest
+        with _pytest.raises(SystemExit):
+            parser.parse_args(
+                ["--from", "2026-08-05", "--to", "2026-08-05", "--tic-scope", "2"]
+            )
+
+    def test_invalid_scope_never_reaches_transport(self, tmp_path):
+        calls = []
+
+        def transport(url, body, headers):
+            calls.append(body)
+            return make_minute_page([], cont_yn="N")
+
+        with pytest.raises(ValueError):
+            CollectorConfig(
+                from_date="2026-08-05",
+                to_date="2026-08-05",
+                tic_scope=2,
+                output=str(tmp_path / "out.jsonl"),
+                metadata_output=str(tmp_path / "out.meta.json"),
+            )
+        assert calls == []
+
+    def test_existing_contract_preserved(self, tmp_path):
+        """inds_cd=001 / KOSPI / index / fail-closed still hold."""
+        from fmindex.market.kospi_collector import (
+            API_ID_MINUTE_CHART,
+            KOSPI_INDS_CD,
+            SECTOR_PATH,
+            TABLE_MINUTE,
+        )
+        from fmindex.market.models import ASSET_TYPE_INDEX, KOSPI_SYMBOL
+        assert API_ID_MINUTE_CHART == "ka20005"
+        assert SECTOR_PATH == "/api/dostk/chart"
+        assert TABLE_MINUTE == "inds_min_pole_qry"
+        assert KOSPI_INDS_CD == "001"
+        assert KOSPI_SYMBOL == "KOSPI"
+        assert ASSET_TYPE_INDEX == "index"
+
+
 class TestPipelineRealContract:
     def test_pipeline_real_mode_contract_pass(self, tmp_path):
         """kiwoom mode with a validated KOSPI file yields real data."""

@@ -11,10 +11,14 @@ Endpoints (confirmed official contract):
   table: inds_dt_pole_qry — fields: cur_prc, trde_qty, dt, open_pric,
          high_pric, low_pric, trde_prica
 
-When the API returns true 60-minute index candles (tic_scope="60"),
+When the API returns true 60-minute index candles (tic_scope=60),
 those are used directly. Minute buckets (tic_scope < 60) are aggregated
 into hourly OHLC: open=first open, high=max high, low=min low,
 close=last close, volume=sum (null if the API does not provide it).
+
+The Kiwoom live API requires tic_scope as a JSON number. Sending the
+string "60" is rejected with return_code=2 (type mismatch), so the
+canonical internal type is int and the CLI parses it as int.
 
 Usage:
     python -m fmindex.market.kospi_collector --from 2026-07-01 --to 2026-08-05
@@ -84,6 +88,55 @@ DEFAULT_MAX_REQUESTS = 500
 #: Default overlap window (hours) re-fetched on incremental runs.
 DEFAULT_OVERLAP_HOURS = 8
 
+#: Allowed tic_scope values. The Kiwoom live API requires this value as a
+#: JSON number (integer); sending the string "60" is rejected with
+#: return_code=2 (type mismatch). The canonical internal type is int.
+ALLOWED_TIC_SCOPES = (
+    1,
+    3,
+    5,
+    10,
+    15,
+    30,
+    45,
+    60,
+)
+
+#: Canonical string representations accepted for compatibility. Only exact
+#: matches are allowed (e.g. "60" -> 60, "05" is rejected).
+ALLOWED_TIC_SCOPE_STRINGS = tuple(str(v) for v in ALLOWED_TIC_SCOPES)
+
+
+def _canonicalize_tic_scope(value: Any) -> int:
+    """Return ``value`` as a canonical int tic_scope or raise ValueError.
+
+    Accepted inputs:
+    - int in ALLOWED_TIC_SCOPES
+    - exact string form of an allowed value (e.g. "60" -> 60)
+
+    Rejected inputs raise ValueError before any API request is made:
+    0, 2, 59, 90, "abc", "05", None, True, False, floats, etc.
+    """
+    if isinstance(value, bool):
+        raise ValueError(
+            f"invalid tic_scope {value!r}: expected one of {ALLOWED_TIC_SCOPES}"
+        )
+    if isinstance(value, int):
+        if value in ALLOWED_TIC_SCOPES:
+            return value
+        raise ValueError(
+            f"invalid tic_scope {value!r}: expected one of {ALLOWED_TIC_SCOPES}"
+        )
+    if isinstance(value, str):
+        if value in ALLOWED_TIC_SCOPE_STRINGS:
+            return int(value)
+        raise ValueError(
+            f"invalid tic_scope {value!r}: expected one of {ALLOWED_TIC_SCOPES}"
+        )
+    raise ValueError(
+        f"invalid tic_scope {value!r}: expected one of {ALLOWED_TIC_SCOPES}"
+    )
+
 
 class NoTradingDaysError(RuntimeError):
     """Raised when the requested range contains no supported trading days.
@@ -107,7 +160,7 @@ class CollectorConfig:
         request_delay: float = 1.0,
         force_refresh: bool = False,
         overlap_hours: int = DEFAULT_OVERLAP_HOURS,
-        tic_scope: str = "60",
+        tic_scope: int = 60,
     ) -> None:
         self.from_date = from_date
         self.to_date = to_date
@@ -118,7 +171,9 @@ class CollectorConfig:
         self.request_delay = request_delay
         self.force_refresh = force_refresh
         self.overlap_hours = overlap_hours
-        self.tic_scope = tic_scope
+        # Canonical int; validated here so the request body only ever
+        # carries an int tic_scope (never a string).
+        self.tic_scope = _canonicalize_tic_scope(tic_scope)
 
 
 class KospiCollector:
@@ -193,7 +248,7 @@ class KospiCollector:
     def collect_day(self, trade_date) -> List[HourlyIndexRecord]:
         """Collect hourly records for a single trading date.
 
-        Uses the official 60-minute index chart (ka20005, tic_scope="60")
+        Uses the official 60-minute index chart (ka20005, tic_scope=60)
         when available; falls back to aggregating minute candles otherwise.
         """
         if hasattr(trade_date, "strftime"):
@@ -247,7 +302,7 @@ class KospiCollector:
         body: Dict[str, Any] = {
             "mrkt_tp": KOSPI_MRKT_TP,
             "inds_cd": KOSPI_INDS_CD,
-            "tic_scope": (self.config.tic_scope if self.config else "60"),
+            "tic_scope": (self.config.tic_scope if self.config else 60),
             "base_dt": date_str,
         }
         pages = self.client.fetch_all(API_ID_MINUTE_CHART, SECTOR_PATH, body)
@@ -721,8 +776,8 @@ def run_collector(config: CollectorConfig) -> Dict[str, Any]:
     }
 
 
-def main() -> None:
-    """CLI entry point."""
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser (exposed for CLI contract tests)."""
     parser = argparse.ArgumentParser(
         description="Collect KOSPI index hourly OHLC from the Kiwoom REST API"
     )
@@ -737,7 +792,20 @@ def main() -> None:
     parser.add_argument("--request-delay", type=float, default=1.0)
     parser.add_argument("--force-refresh", action="store_true")
     parser.add_argument("--overlap-hours", type=int, default=DEFAULT_OVERLAP_HOURS)
-    parser.add_argument("--tic-scope", default="60", choices=["1", "3", "5", "10", "15", "30", "45", "60"])
+    parser.add_argument(
+        "--tic-scope",
+        type=int,
+        default=60,
+        choices=ALLOWED_TIC_SCOPES,
+        help="Minute chart interval for ka20005 (1|3|5|10|15|30|45|60). "
+        "Sent to the Kiwoom API as a JSON number.",
+    )
+    return parser
+
+
+def main() -> None:
+    """CLI entry point."""
+    parser = build_parser()
     args = parser.parse_args()
 
     config = CollectorConfig(

@@ -86,7 +86,7 @@ timestamps are converted to KST.
 
 ## Hourly OHLC aggregation
 
-When the API provides true 60-minute candles (`tic_scope="60"`) those are used
+When the API provides true 60-minute candles (`tic_scope=60`) those are used
 directly. For minute buckets, aggregation rules:
 
 - `open` = first candle open
@@ -164,13 +164,28 @@ The dashboard UI files are not modified by this work.
   (no `KIWOOM_APPKEY`/`KIWOOM_SECRETKEY` in this environment).
 - The 2026 public-holiday snapshot is best-effort; the KRX official calendar
   should be checked before live backfills over holiday dates.
-- 60-minute buckets are produced from `tic_scope="60"`; minute-level
+- 60-minute buckets are produced from `tic_scope=60`; minute-level
   aggregation (tic_scope < 60) is implemented and covered by tests but not
   exercised against the live API.
 
 ---
 
 ## Offline contract alignment (PR #8 fix)
+
+### tic_scope is a JSON number (live API contract)
+
+The Kiwoom live API requires `tic_scope` as a **JSON number** (integer).
+Sending the string `"60"` is rejected with `return_code=2`
+(`파라미터=tic_scope 실패사유= 타입 불일치`).
+
+- `CollectorConfig.tic_scope` canonical type is `int`.
+- The CLI `--tic-scope` parses as `int` and validates against
+  `ALLOWED_TIC_SCOPES = (1, 3, 5, 10, 15, 30, 45, 60)`.
+- String inputs such as `"60"` are canonicalized to `int 60` for
+  compatibility; any other value (`0`, `2`, `59`, `90`, `"abc"`, `"05"`,
+  `None`, `True`, `False`, floats) raises `ValueError` before any API
+  request is made (fail-fast).
+- The request body always carries an `int` `tic_scope`.
 
 ### Pagination uses response headers
 
