@@ -1,514 +1,693 @@
-"use strict";
-
-const STORAGE_KEYS = {
-  theme: "fmindex.theme",
-  colorMode: "fmindex.colorMode",
-  riseColor: "fmindex.riseColor",
-  fallColor: "fmindex.fallColor",
-};
-
-const state = {
-  data: { joined: [], overnight: null, summary: {} },
-  market: "KOSPI",
-  period: "24h",
-  view: "companion",
-  theme: localStorage.getItem(STORAGE_KEYS.theme) || "light",
-  colorMode: localStorage.getItem(STORAGE_KEYS.colorMode) || "kr",
-  riseColor: localStorage.getItem(STORAGE_KEYS.riseColor) || "#d84a4a",
-  fallColor: localStorage.getItem(STORAGE_KEYS.fallColor) || "#356ac3",
-  chart: null,
-};
-
-const byId = (id) => document.getElementById(id);
-const all = (selector) => Array.from(document.querySelectorAll(selector));
-
-function setText(id, value) {
-  const node = byId(id);
-  if (node) node.textContent = value == null ? "—" : String(value);
-}
-
-function formatNumber(value, digits = 1) {
-  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "—";
-}
-
-function formatPercent(value, digits = 0) {
-  return typeof value === "number" && Number.isFinite(value) ? `${(value * 100).toFixed(digits)}%` : "—";
-}
-
-function formatDateTime(value) {
-  if (!value) return "—";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat("ko-KR", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(date);
-}
-
-function cssVar(name) {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-}
-
-function applyTheme(theme) {
-  state.theme = theme === "dark" ? "dark" : "light";
-  document.documentElement.dataset.theme = state.theme;
-  localStorage.setItem(STORAGE_KEYS.theme, state.theme);
-
-  const toggle = byId("themeToggle");
-  if (toggle) {
-    const isDark = state.theme === "dark";
-    toggle.setAttribute("aria-pressed", String(isDark));
-    toggle.setAttribute("aria-label", isDark ? "라이트 모드로 전환" : "다크 모드로 전환");
-  }
-
-  if (state.chart) renderChart();
-}
-
-function colorPreset(mode) {
-  if (mode === "us") return { rise: "#2f9b64", fall: "#d84a4a" };
-  if (mode === "custom") return { rise: state.riseColor, fall: state.fallColor };
-  return { rise: "#d84a4a", fall: "#356ac3" };
-}
-
-function applyColorMode(mode) {
-  state.colorMode = ["kr", "us", "custom"].includes(mode) ? mode : "kr";
-  const colors = colorPreset(state.colorMode);
-  document.documentElement.style.setProperty("--rise", colors.rise);
-  document.documentElement.style.setProperty("--fall", colors.fall);
-  localStorage.setItem(STORAGE_KEYS.colorMode, state.colorMode);
-
-  all('input[name="colorMode"]').forEach((input) => {
-    input.checked = input.value === state.colorMode;
-  });
-
-  const custom = byId("customColorFields");
-  if (custom) custom.hidden = state.colorMode !== "custom";
-
-  updateCurrentIndex();
-  if (state.chart) renderChart();
-}
-
-function showSection(sectionId) {
-  all(".page-section").forEach((section) => {
-    const active = section.id === sectionId;
-    section.hidden = !active;
-    section.classList.toggle("is-active", active);
-  });
-
-  all("[data-section]").forEach((button) => {
-    const active = button.dataset.section === sectionId;
-    button.classList.toggle("is-active", active);
-    if (button.matches(".nav-item")) button.setAttribute("aria-current", active ? "page" : "false");
-  });
-
-  if (sectionId === "today" && state.chart) {
-    window.setTimeout(() => state.chart.resize(), 0);
-  }
-}
-
-function filterByPeriod(records, period) {
-  if (period === "all" || records.length === 0) return records.slice();
-  const validDates = records
-    .map((record) => new Date(record.timestamp))
-    .filter((date) => !Number.isNaN(date.getTime()));
-  if (validDates.length === 0) return [];
-
-  const latest = new Date(Math.max(...validDates.map((date) => date.getTime())));
-  const periodMs = period === "24h"
-    ? 24 * 60 * 60 * 1000
-    : period === "7d"
-      ? 7 * 24 * 60 * 60 * 1000
-      : 30 * 24 * 60 * 60 * 1000;
-  const cutoff = latest.getTime() - periodMs;
-
-  return records.filter((record) => {
-    const date = new Date(record.timestamp);
-    return !Number.isNaN(date.getTime()) && date.getTime() >= cutoff;
-  });
-}
-
-function marketRecords() {
-  const records = Array.isArray(state.data.joined) ? state.data.joined : [];
-  const filtered = filterByPeriod(records, state.period);
-  if (state.market === "KOSPI") return filtered;
-
-  return filtered.map((record) => ({
-    ...record,
-    market: "NASDAQ",
-    marketNormalized: null,
-    marketChangeRate: null,
-    dataMode: "unavailable",
-  }));
-}
-
-function latestSentimentRecords() {
-  return marketRecords().filter((record) => record.hasSentiment !== false && record.fmIndex != null);
-}
-
-function sentimentTone(value) {
-  if (typeof value !== "number") return { label: "데이터 대기", className: "tone-badge--neutral" };
-  if (value >= 65) return { label: "강한 긍정", className: "tone-badge--positive" };
-  if (value > 55) return { label: "긍정", className: "tone-badge--positive" };
-  if (value <= 35) return { label: "강한 부정", className: "tone-badge--negative" };
-  if (value < 45) return { label: "부정", className: "tone-badge--negative" };
-  return { label: "중립", className: "tone-badge--neutral" };
-}
-
-function updateCurrentIndex() {
-  const records = latestSentimentRecords();
-  const latest = records.at(-1) || null;
-  const previous = records.at(-2) || null;
-  const current = latest?.fmIndex;
-  const change = typeof current === "number" && typeof previous?.fmIndex === "number"
-    ? current - previous.fmIndex
-    : null;
-
-  setText("currentFmIndex", formatNumber(current, 1));
-  setText("hourlyChange", change == null ? "—" : `${change > 0 ? "+" : ""}${change.toFixed(1)}`);
-  setText("postCount", `${latest?.postCount ?? 0}개`);
-  setText("confidenceValue", formatPercent(latest?.confidence, 0));
-  setText("providerValue", state.data.summary?.provider || "—");
-  setText("lastUpdated", formatDateTime(latest?.timestamp || state.data.summary?.updatedAt));
-
-  const changeNode = byId("hourlyChange");
-  if (changeNode) {
-    changeNode.classList.toggle("is-rise", change != null && change > 0);
-    changeNode.classList.toggle("is-fall", change != null && change < 0);
-  }
-
-  const tone = sentimentTone(current);
-  const badge = byId("sentimentStateBadge");
-  if (badge) {
-    badge.textContent = tone.label;
-    badge.className = `tone-badge ${tone.className}`;
-  }
-
-  updateInsight(latest, change);
-}
-
-function updateInsight(latest, change) {
-  if (!latest || latest.fmIndex == null) {
-    setText("insightTitle", "현재 시간대의 심리 표본이 없습니다.");
-    setText("insightBody", "누락값을 중립값 50으로 채우지 않고 차트 공백으로 표시합니다.");
-    return;
-  }
-
-  const tone = sentimentTone(latest.fmIndex).label;
-  const movement = change == null
-    ? "직전 비교 데이터가 없습니다"
-    : change > 0
-      ? `직전 시간보다 ${change.toFixed(1)}포인트 높아졌습니다`
-      : change < 0
-        ? `직전 시간보다 ${Math.abs(change).toFixed(1)}포인트 낮아졌습니다`
-        : "직전 시간과 같은 수준입니다";
-
-  if (state.market === "NASDAQ") {
-    setText("insightTitle", `현재 커뮤니티 심리는 ${tone}입니다.`);
-    setText("insightBody", `${movement}. 나스닥 시장 데이터는 아직 연동되지 않아 시장 방향 비교는 제공하지 않습니다.`);
-    return;
-  }
-
-  const marketText = latest.marketChangeRate == null
-    ? "시장 변동 데이터가 없습니다"
-    : `동시간 코스피 변화는 ${latest.marketChangeRate > 0 ? "+" : ""}${latest.marketChangeRate.toFixed(2)}%입니다`;
-  setText("insightTitle", `현재 커뮤니티 심리는 ${tone}입니다.`);
-  setText("insightBody", `${movement}. ${marketText}. 현재 값은 샘플 구조 검증용이며 예측 정확도를 의미하지 않습니다.`);
-}
-
-function updateModeBadge() {
-  const mode = state.data.summary?.dataMode || "unavailable";
-  const headerBadge = byId("headerModeBadge");
-  if (headerBadge) {
-    headerBadge.textContent = mode === "real" ? "REAL DATA" : mode === "sample" ? "SAMPLE DATA" : "DATA UNAVAILABLE";
-    headerBadge.className = `status-badge ${mode === "real" ? "status-badge--real" : mode === "sample" ? "status-badge--sample" : "status-badge--muted"}`;
-  }
-  const sampleNotice = byId("sampleNotice");
-  if (sampleNotice) sampleNotice.hidden = mode === "real";
-}
-
-function updateSessionPanel() {
-  const isKospi = state.market === "KOSPI";
-  setText("sessionEyebrow", isKospi ? "국내시장" : "미국시장");
-  setText("sessionTitle", isKospi ? "야간 심리와 다음 국내장" : "한국 주간 심리와 미국장 결과");
-  setText("sessionMiddleLabel", isKospi ? "야간선물" : "미국장 개장");
-  setText("sessionPrimary", isKospi ? "실제 거래일·야간선물 데이터 연동 전입니다." : "실제 나스닥 세션 데이터 연동 전입니다.");
-  setText(
-    "sessionDescription",
-    isKospi
-      ? "국내장 마감 이후 심리, 야간선물, 다음 날 시가·장초·종가를 순서대로 연결할 예정입니다."
-      : "한국시간 주간 심리와 미국장 개장·장초·종가를 연결할 예정입니다."
-  );
-
-  const overnight = state.data.overnight || {};
-  const status = overnight.status || "unavailable";
-  const badge = byId("sessionStatusBadge");
-  if (badge) {
-    badge.textContent = status === "available" ? "연동 완료" : "연동 전";
-    badge.className = `status-badge ${status === "available" ? "status-badge--real" : "status-badge--muted"}`;
-  }
-}
-
-function updateStatusPanel() {
-  const summary = state.data.summary || {};
-  const records = marketRecords();
-  const latest = records.at(-1) || {};
-  const hasSentiment = records.some((record) => record.hasSentiment !== false && record.fmIndex != null);
-  const dataMode = state.market === "NASDAQ" ? "unavailable" : summary.dataMode || latest.dataMode || "unavailable";
-  const source = state.market === "NASDAQ" ? "미연동" : latest.source || summary.marketSource || "sample-data";
-  const updated = latest.timestamp || summary.updatedAt;
-
-  setText("statusMarket", state.market);
-  setText("statusDataMode", dataMode);
-  setText("statusSource", source);
-  setText("statusSentiment", hasSentiment ? "있음" : "없음");
-  setText("statusMethodology", summary.methodologyVersion || "fmindex-v1");
-  setText("detailMarket", state.market);
-  setText("detailDataMode", dataMode);
-  setText("detailUpdated", formatDateTime(updated));
-  setText("detailProvider", summary.provider || "—");
-  setText("detailOvernight", state.data.overnight?.status || "unavailable");
-}
-
-function updateChartStatus(records) {
-  let message = "";
-  if (state.market === "NASDAQ") {
-    message = "나스닥 시장 데이터 미연동 · 현재는 펨코지수만 표시합니다.";
-  } else if (records.length === 0) {
-    message = "선택 기간에 표시할 데이터가 없습니다.";
-  } else if (state.view === "lead") {
-    message = "선행 관계 계산은 실제 축적 데이터가 확보된 뒤 제공합니다. 현재는 동일 시계열을 유지합니다.";
-  } else if (state.view === "divergence") {
-    message = "펨코지수와 시장 변화 방향이 반대인 지점을 원형 마커로 강조합니다.";
+/* ======================================================================
+   FM INDEX — 시장심리 대시보드
+   Chart-first light dashboard. Pure functions are exported for node tests.
+   ====================================================================== */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory();
   } else {
-    message = "동일한 시간축에서 커뮤니티 심리와 시장 흐름을 비교합니다.";
+    root.FMIndexUI = factory();
   }
-  setText("chartStatus", message);
-}
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
 
-function divergencePointRadii(records) {
-  if (state.view !== "divergence") return records.map(() => 0);
-  return records.map((record, index) => {
-    if (index === 0 || record.fmIndex == null || records[index - 1]?.fmIndex == null || record.marketChangeRate == null) return 0;
-    const sentimentDelta = record.fmIndex - records[index - 1].fmIndex;
-    const opposite = sentimentDelta !== 0 && record.marketChangeRate !== 0 && Math.sign(sentimentDelta) !== Math.sign(record.marketChangeRate);
-    return opposite ? 5 : 0;
-  });
-}
+  /* ---------------------------------------------------------------
+     Settings & persistence (storage injectable for tests)
+     --------------------------------------------------------------- */
+  var STORAGE_KEYS = {
+    theme: 'fmindex.theme',
+    colorMode: 'fmindex.colorMode',
+    customUp: 'fmindex.customUp',
+    customDown: 'fmindex.customDown',
+  };
 
-function renderChart() {
-  const canvas = byId("mainChart");
-  if (!canvas || typeof Chart === "undefined") {
-    setText("chartStatus", "Chart.js를 불러오지 못했습니다. 네트워크 또는 정적 자산 상태를 확인하세요.");
-    return;
+  var COLOR_MODE_DEFAULTS = {
+    kr:  { up: '#e53935', down: '#1e63c7' },
+    us:  { up: '#2e9e5b', down: '#e53935' },
+  };
+
+  function defaultSettings() {
+    return {
+      theme: 'light',
+      colorMode: 'kr',
+      customUp: '#e53935',
+      customDown: '#1e63c7',
+      market: 'KOSPI',
+      period: '24h',
+      view: 'sync',
+    };
   }
 
-  const records = marketRecords();
-  updateChartStatus(records);
-  const labelFormatter = new Intl.DateTimeFormat("ko-KR", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
-  const labels = records.map((record) => {
-    const date = new Date(record.timestamp);
-    return Number.isNaN(date.getTime()) ? "—" : labelFormatter.format(date);
-  });
-  const fmValues = records.map((record) => record.fmIndex == null ? null : record.fmIndex);
-  const marketValues = records.map((record) => record.marketNormalized == null ? null : record.marketNormalized);
-  const pointRadius = divergencePointRadii(records);
-  const gridColor = cssVar("--border");
-  const muted = cssVar("--muted");
-  const text = cssVar("--text");
-  const fmColor = cssVar("--fm-line");
-  const marketColor = cssVar("--market-line");
+  function readSettings(storage) {
+    var s = defaultSettings();
+    if (!storage) return s;
+    try {
+      s.theme = storage.getItem(STORAGE_KEYS.theme) || s.theme;
+      s.colorMode = storage.getItem(STORAGE_KEYS.colorMode) || s.colorMode;
+      var cu = storage.getItem(STORAGE_KEYS.customUp);
+      var cd = storage.getItem(STORAGE_KEYS.customDown);
+      if (cu) s.customUp = cu;
+      if (cd) s.customDown = cd;
+    } catch (e) { /* storage unavailable */ }
+    if (s.theme !== 'light' && s.theme !== 'dark') s.theme = 'light';
+    if (s.colorMode !== 'kr' && s.colorMode !== 'us' && s.colorMode !== 'custom') s.colorMode = 'kr';
+    return s;
+  }
 
-  if (state.chart) state.chart.destroy();
-  state.chart = new Chart(canvas, {
-    type: "line",
-    data: {
-      labels,
-      datasets: [
-        {
-          label: "펨코지수",
-          data: fmValues,
-          borderColor: fmColor,
-          backgroundColor: `${fmColor}1f`,
-          yAxisID: "sentiment",
-          borderWidth: 2.3,
-          tension: 0.28,
-          fill: true,
-          spanGaps: false,
-          pointRadius,
-          pointHoverRadius: 5,
-          pointBackgroundColor: fmColor,
-        },
-        {
-          label: state.market === "KOSPI" ? "코스피 정규화" : "나스닥 정규화",
-          data: marketValues,
-          borderColor: marketColor,
-          backgroundColor: "transparent",
-          yAxisID: "market",
-          borderWidth: 2,
-          tension: 0.22,
-          fill: false,
-          spanGaps: false,
-          pointRadius: 0,
-          pointHoverRadius: 4,
-          borderDash: state.market === "NASDAQ" ? [6, 5] : [],
-        },
-      ],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: "index", intersect: false },
-      animation: { duration: 260 },
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          backgroundColor: cssVar("--surface"),
-          borderColor: gridColor,
-          borderWidth: 1,
-          titleColor: text,
-          bodyColor: text,
-          displayColors: true,
-          callbacks: {
-            afterBody(items) {
-              const record = records[items[0]?.dataIndex];
-              if (!record) return [];
-              return [
-                `게시글 ${record.postCount ?? 0}개`,
-                `신뢰도 ${formatPercent(record.confidence, 0)}`,
-                `데이터 ${record.dataMode || state.data.summary?.dataMode || "unavailable"}`,
-              ];
+  function saveSettings(storage, settings) {
+    if (!storage) return;
+    try {
+      storage.setItem(STORAGE_KEYS.theme, settings.theme);
+      storage.setItem(STORAGE_KEYS.colorMode, settings.colorMode);
+      storage.setItem(STORAGE_KEYS.customUp, settings.customUp);
+      storage.setItem(STORAGE_KEYS.customDown, settings.customDown);
+    } catch (e) { /* storage unavailable */ }
+  }
+
+  // URL query-param deep link: ?theme=dark&market=NASDAQ&colors=us&period=30d&view=divergence
+  function readUrlParams(search) {
+    var p = search || (typeof location !== 'undefined' ? location.search : '');
+    var out = {};
+    if (!p) return out;
+    try {
+      var qs = new URLSearchParams(p);
+      var theme = qs.get('theme');
+      if (theme === 'light' || theme === 'dark') out.theme = theme;
+      var colors = qs.get('colors');
+      if (colors === 'kr' || colors === 'us' || colors === 'custom') out.colorMode = colors;
+      var market = qs.get('market');
+      if (market === 'KOSPI' || market === 'NASDAQ') out.market = market;
+      var period = qs.get('period');
+      if (period === '24h' || period === '7d' || period === '30d' || period === 'all') out.period = period;
+      var view = qs.get('view');
+      if (view === 'sync' || view === 'lead' || view === 'divergence') out.view = view;
+      var up = qs.get('up');
+      var down = qs.get('down');
+      if (up && /^#[0-9a-fA-F]{6}$/.test(up)) out.customUp = up;
+      if (down && /^#[0-9a-fA-F]{6}$/.test(down)) out.customDown = down;
+    } catch (e) { /* URLSearchParams unavailable */ }
+    return out;
+  }
+
+  function upDownColors(settings) {
+    var c = COLOR_MODE_DEFAULTS[settings.colorMode] || COLOR_MODE_DEFAULTS.kr;
+    if (settings.colorMode === 'custom') {
+      c = { up: settings.customUp || COLOR_MODE_DEFAULTS.kr.up,
+            down: settings.customDown || COLOR_MODE_DEFAULTS.kr.down };
+    }
+    return c;
+  }
+
+  /* ---------------------------------------------------------------
+     Pure data logic (node-testable)
+     --------------------------------------------------------------- */
+
+  // timestamp 기준 기간 필터 (레코드 개수 기준 아님)
+  // 컷오프는 벽시계가 아니라 입력 데이터의 최신 유효 timestamp를 앵커로 사용한다.
+  // 서버 filter_by_period와 동일한 경계 규칙: timestamp >= cutoff
+  function filterByPeriod(data, period) {
+    if (!period || period === 'all') return data;
+    var hours = period === '24h' ? 24 : period === '7d' ? 168 : period === '30d' ? 720 : null;
+    if (hours === null) return data;
+    var valid = [];
+    data.forEach(function (d) {
+      var t = new Date(d.timestamp);
+      if (!isNaN(t.getTime())) valid.push({ t: t, d: d });
+    });
+    if (!valid.length) return [];
+    var latest = Math.max.apply(null, valid.map(function (v) { return v.t.getTime(); }));
+    var cutoff = latest - hours * 60 * 60 * 1000;
+    return valid
+      .filter(function (v) { return v.t.getTime() >= cutoff; })
+      .map(function (v) { return v.d; });
+  }
+
+  // 선택 기간 첫 close 기준 100 정규화
+  function normalizeMarket(data) {
+    if (!data.length) return [];
+    var base = data[0].marketNormalized;
+    if (!base || base === 0) base = 100;
+    return data.map(function (d) {
+      var v = d.marketNormalized;
+      return v != null ? Math.round((v / base) * 10000) / 100 : null;
+    });
+  }
+
+  // 시장 시계열: NASDAQ은 실제 시계열이 없으므로 KOSPI 값을 재라벨링하지 않고
+  // null(unavailable)을 반환한다. KOSPI는 기존 정규화 시계열을 사용한다.
+  function marketSeriesFor(joined, market) {
+    if (market === 'NASDAQ') return (joined || []).map(function () { return null; });
+    return normalizeMarket(joined || []);
+  }
+
+  function buildChartData(joined, period) {
+    var filtered = filterByPeriod(joined, period);
+    var labels = filtered.map(function (d) { return d.timestamp ? d.timestamp.slice(0, 16) : ''; });
+    // null은 null로 유지 (gap), 0은 실제 0으로 유지
+    var fmData = filtered.map(function (d) { return d.fmIndex != null ? d.fmIndex : null; });
+    var marketData = normalizeMarket(filtered);
+    return { labels: labels, fmData: fmData, marketData: marketData, source: filtered };
+  }
+
+  // 괴리 구간: 펨코 방향(>=50 상승) vs 시장 방향(변동률 부호)이 다른 지점
+  function buildDivergence(joined, period) {
+    var filtered = filterByPeriod(joined, period);
+    var pts = [];
+    filtered.forEach(function (d, i) {
+      if (d.fmIndex == null || d.marketChangeRate == null) return;
+      var fmDir = d.fmIndex >= 50 ? 1 : d.fmIndex < 50 ? -1 : 0;
+      var mkDir = d.marketChangeRate > 0 ? 1 : d.marketChangeRate < 0 ? -1 : 0;
+      if (fmDir !== 0 && mkDir !== 0 && fmDir !== mkDir) {
+        pts.push({ x: i, y: d.fmIndex, fm: d.fmIndex, change: d.marketChangeRate });
+      }
+    });
+    return pts;
+  }
+
+  function sentimentLabel(fm) {
+    if (fm == null) return '데이터 없음';
+    if (fm >= 75) return '매우 긍정';
+    if (fm >= 60) return '긍정';
+    if (fm > 40) return '중립';
+    if (fm > 25) return '부정';
+    return '강한 부정';
+  }
+
+  function sentimentClass(fm) {
+    if (fm == null) return 'flat';
+    if (fm >= 60) return 'up';
+    if (fm <= 40) return 'down';
+    return 'flat';
+  }
+
+  function fmChangeText(latest, prev) {
+    if (!latest || latest.fmIndex == null) return '지난 1시간 –';
+    if (!prev || prev.fmIndex == null) return '지난 1시간 –';
+    var delta = Math.round((latest.fmIndex - prev.fmIndex) * 10) / 10;
+    return '지난 1시간 ' + (delta > 0 ? '+' : '') + delta.toFixed(1);
+  }
+
+  function escapeHtml(str) {
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function sampleBadgeVisible(dataMode) {
+    return dataMode === 'sample';
+  }
+
+  // 오늘의 해석 — 데이터에서 파생된 문장 (가짜 수치 아님)
+  function interpretToday(latest, summary) {
+    if (!latest || latest.fmIndex == null) {
+      return '아직 심리 데이터가 없습니다. 파이프라인이 데이터를 생성하면 여기에 해석이 표시됩니다.';
+    }
+    var label = sentimentLabel(latest.fmIndex);
+    var parts = ['현재 펨코지수는 ' + latest.fmIndex.toFixed(1) + '로 ' + label + ' 구간입니다.'];
+    if (summary && summary.totalAnalyzed) {
+      parts.push('오늘 분석 표본은 ' + summary.totalAnalyzed + '건, 평균 신뢰도는 ' +
+        Math.round((summary.avgConfidence || 0) * 100) + '%입니다.');
+    }
+    if (summary && summary.dataMode === 'sample') {
+      parts.push('현재 화면은 샘플 데이터로 구조 검증용입니다. 실제 시장 데이터로 오인하지 마세요.');
+    }
+    return parts.join(' ');
+  }
+
+  // 야간(국내) / 주간(미국) 패널 — 실제 세션 데이터 없으면 unavailable 문구만
+  function sessionPanelHtml(market, overnight, summary) {
+    var overnightStatus = (overnight && overnight.overnight && overnight.overnight.status) || 'unavailable';
+    if (market === 'NASDAQ') {
+      var title = '한국 주간 심리와 미국장 결과';
+      var cells = [
+        ['한국시간 주간 펨코심리', '–'],
+        ['미국장 개장', '–'],
+        ['장초', '–'],
+        ['종가', '–'],
+        ['방향 일치', '–'],
+      ];
+      var note = '실제 나스닥 세션 데이터 연동 전입니다. 현재 화면은 구조 검증용 샘플이며, 실제 수치로 표시하지 않습니다.';
+      return renderSessionPanel(title, cells, note, overnightStatus);
+    }
+    var title2 = '야간 심리와 다음 국내장';
+    var cells2 = [
+      ['국내장 마감 후~다음 개장 전 야간 심리', '–'],
+      ['야간선물 데이터', '–'],
+      ['다음 날 시가', '–'],
+      ['장초 1시간', '–'],
+      ['종가', '–'],
+      ['방향 일치 여부', '–'],
+    ];
+    var note2 = '실제 거래일·야간선물 데이터 연동 전입니다. 현재 화면은 구조 검증용 샘플입니다.';
+    return renderSessionPanel(title2, cells2, note2, overnightStatus);
+  }
+
+  function renderSessionPanel(title, cells, note, overnightStatus) {
+    var statusBadge = overnightStatus === 'unavailable'
+      ? '<span class="badge badge-unavailable">UNAVAILABLE</span>'
+      : '<span class="badge badge-sample">' + escapeHtml(overnightStatus) + '</span>';
+    var rows = cells.map(function (c) {
+      return '<div class="session-cell"><div class="session-cell-label">' + escapeHtml(c[0]) +
+        '</div><div class="session-cell-value">' + escapeHtml(c[1]) + '</div></div>';
+    }).join('');
+    return '<div class="session-title">' + escapeHtml(title) + ' ' + statusBadge + '</div>' +
+      '<div class="session-grid">' + rows + '</div>' +
+      '<p class="session-note">' + escapeHtml(note) + '</p>';
+  }
+
+  function directionMatchCardsHtml() {
+    // 실제 계산 데이터가 없으면 대시보드는 — / 데이터 축적 중 / 유효 표본 0건 표시
+    var items = ['다음 시가 방향 일치율', '장초 1시간 방향 일치율', '당일 종가 방향 일치율', '평균 선행 시간'];
+    return items.map(function (label) {
+      return '<div class="match-card card"><div class="match-label">' + escapeHtml(label) +
+        '</div><div class="match-value">—</div>' +
+        '<div class="match-sub">데이터 축적 중 · 유효 표본 0건</div></div>';
+    }).join('');
+  }
+
+  // ------------------------------------------------------------------
+  // Browser-only wiring (guarded so node require is safe)
+  // ------------------------------------------------------------------
+  if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+    (function () {
+      var settings = readSettings(window.localStorage);
+      var chart = null;
+      var data = null;
+
+      function applyTheme(theme) {
+        document.documentElement.setAttribute('data-theme', theme);
+        var sel = document.getElementById('themeSelect');
+        if (sel) sel.value = theme;
+        var btn = document.getElementById('themeToggle');
+        if (btn) {
+          btn.textContent = theme === 'dark' ? '☀️' : '🌙';
+          btn.setAttribute('aria-pressed', theme === 'dark' ? 'true' : 'false');
+          btn.setAttribute('aria-label', theme === 'dark' ? '라이트 모드로 전환' : '다크 모드로 전환');
+        }
+      }
+
+      function applyColors() {
+        var c = upDownColors(settings);
+        var root = document.documentElement.style;
+        root.setProperty('--up', c.up);
+        root.setProperty('--down', c.down);
+        root.setProperty('--up-soft', hexToRgba(c.up, 0.10));
+        root.setProperty('--down-soft', hexToRgba(c.down, 0.10));
+        var customRow = document.getElementById('customColorRow');
+        if (customRow) customRow.classList.toggle('is-hidden', settings.colorMode !== 'custom');
+        var cm = document.getElementById('colorModeSelect');
+        if (cm) cm.value = settings.colorMode;
+        var cu = document.getElementById('customUpColor');
+        var cd = document.getElementById('customDownColor');
+        if (cu) cu.value = settings.customUp;
+        if (cd) cd.value = settings.customDown;
+      }
+
+      function hexToRgba(hex, alpha) {
+        var m = /^#([0-9a-fA-F]{6})$/.exec(hex || '');
+        if (!m) return 'rgba(0,0,0,0.1)';
+        var n = parseInt(m[1], 16);
+        return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + alpha + ')';
+      }
+
+      function cssVar(name) {
+        return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#888';
+      }
+
+      function switchSection(name) {
+        document.querySelectorAll('.section').forEach(function (sec) {
+          sec.classList.toggle('is-active', sec.id === 'section-' + name);
+          sec.hidden = sec.id !== 'section-' + name;
+        });
+        document.querySelectorAll('.tab').forEach(function (t) {
+          var active = t.getAttribute('data-section') === name;
+          t.classList.toggle('is-active', active);
+          if (active) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current');
+        });
+        document.querySelectorAll('.mobile-nav button').forEach(function (b) {
+          b.classList.toggle('is-active', b.getAttribute('data-section') === name);
+        });
+      }
+
+      function setControl(groupAttr, valueAttr, value) {
+        document.querySelectorAll('[' + groupAttr + ']').forEach(function (b) {
+          var active = b.getAttribute(valueAttr) === value;
+          b.classList.toggle('is-active', active);
+          b.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+      }
+
+      function renderStatus(summary) {
+        function set(id, v) {
+          var el = document.getElementById(id);
+          if (el) el.textContent = v;
+        }
+        set('statusDataMode', summary.dataMode || 'unknown');
+        set('dsDataMode', summary.dataMode || 'unknown');
+        var source = (summary.instrument || '') + (summary.symbol && summary.symbol !== summary.instrument ? ' · ' + summary.symbol : '');
+        set('statusMarketSource', source || '—');
+        set('dsMarketSource', source || '—');
+        set('statusSelectedMarket', settings.market);
+        set('dsSelectedMarket', settings.market);
+        set('statusProvider', summary.provider || '—');
+        set('dsProvider', summary.provider || '—');
+        set('statusMethodology', summary.methodologyVersion || '—');
+        set('dsMethodology', summary.methodologyVersion || '—');
+        var overnight = data && data.overnight && data.overnight.overnight;
+        var overnightText = overnight ? (overnight.status + ' · ' + overnight.reason) : 'unavailable';
+        set('statusOvernight', overnightText);
+        set('dsOvernight', overnightText);
+        set('statusUpdated', summary.lastUpdated || '—');
+        set('dsUpdated', summary.lastUpdated || '—');
+      }
+
+      function render() {
+        if (!data) return;
+        var joined = data.joined || [];
+        var summary = data.summary || {};
+        var overnight = data.overnight || null;
+
+        var filtered = filterByPeriod(joined, settings.period);
+        var latest = filtered[filtered.length - 1] || {};
+        var prev = filtered[filtered.length - 2] || {};
+        var colors = upDownColors(settings);
+
+        // SAMPLE DATA 배지
+        var badge = document.getElementById('sampleBadge');
+        var isSample = sampleBadgeVisible(summary.dataMode);
+        if (badge) badge.classList.toggle('is-hidden', !isSample);
+
+        // 현재 지수 카드
+        var fmEl = document.getElementById('currentFmIndex');
+        if (fmEl) fmEl.textContent = latest.fmIndex != null ? latest.fmIndex.toFixed(1) : '–';
+        var sentEl = document.getElementById('currentSentiment');
+        if (sentEl) {
+          sentEl.textContent = sentimentLabel(latest.fmIndex);
+          sentEl.className = 'index-hero-sentiment ' + sentimentClass(latest.fmIndex);
+        }
+        var subEl = document.getElementById('currentFmChange');
+        if (subEl) subEl.textContent = fmChangeText(latest, prev);
+        var statUpdated = document.getElementById('statUpdated');
+        if (statUpdated) statUpdated.textContent = latest.timestamp ? latest.timestamp.slice(5, 16).replace('T', ' ') : '–';
+        var statMarket = document.getElementById('statMarket');
+        if (statMarket) statMarket.textContent = settings.market + ' · ' + (summary.dataMode || 'unknown');
+        var statSample = document.getElementById('statSample');
+        if (statSample) statSample.textContent = (summary.totalPosts != null ? summary.totalPosts : (latest.postCount != null ? latest.postCount : '–')) + ' 글';
+        var statAnalyzed = document.getElementById('statAnalyzed');
+        if (statAnalyzed) statAnalyzed.textContent = '유효 판정 ' + (summary.totalAnalyzed != null ? summary.totalAnalyzed : '–');
+        var statConf = document.getElementById('statConfidence');
+        if (statConf) statConf.textContent = summary.avgConfidence != null ? Math.round(summary.avgConfidence * 100) + '%' : (latest.confidence != null ? Math.round(latest.confidence * 100) + '%' : '–');
+        var hasSentiment = joined.some(function (j) { return j.hasSentiment === true || j.hasSentiment === 'true' || j.hasSentiment === 1; });
+        var statSent = document.getElementById('statSentiment');
+        if (statSent) statSent.textContent = hasSentiment ? '존재' : '없음';
+        var dsSent = document.getElementById('dsSentimentPresence');
+        if (dsSent) dsSent.textContent = hasSentiment ? '존재' : '없음';
+        var statusSent = document.getElementById('statusSentiment');
+        if (statusSent) statusSent.textContent = hasSentiment ? '존재' : '없음';
+
+        // 해석
+        var interp = document.getElementById('todayInterpretation');
+        if (interp) interp.textContent = interpretToday(latest, summary);
+
+        // 방향 일치 카드 (항상 미축적 상태)
+        var matchContainer = document.querySelector('.match-grid');
+        if (matchContainer && !matchContainer.getAttribute('data-rendered')) {
+          matchContainer.innerHTML = directionMatchCardsHtml();
+          matchContainer.setAttribute('data-rendered', 'true');
+        }
+
+        // 세션 패널 (코스피 → 야간, 나스닥 → 미국장)
+        var sessionEl = document.getElementById('sessionPanel');
+        if (sessionEl) sessionEl.innerHTML = sessionPanelHtml(settings.market, overnight, summary);
+
+        // 차트 타이틀
+        var chartTitle = document.getElementById('chartTitle');
+        var viewLabel = settings.view === 'lead' ? '선행' : settings.view === 'divergence' ? '괴리' : '동행';
+        var marketLabel = settings.market === 'NASDAQ' ? '나스닥 (미연동)' : '코스피 (정규화)';
+        if (chartTitle) chartTitle.textContent = '펨코지수 · ' + marketLabel + ' (' + viewLabel + ')';
+        var marketLegend = document.getElementById('marketLegend');
+        if (marketLegend) marketLegend.textContent = marketLabel;
+
+        renderChart();
+        renderViewNotice();
+        renderStatus(summary);
+        updateChartStatus();
+      }
+
+      function renderViewNotice() {
+        var el = document.getElementById('viewNotice');
+        if (!el) return;
+        if (settings.view === 'lead') {
+          el.classList.remove('is-hidden');
+          el.textContent = '선행 관계는 실제 세션 데이터가 축적된 후 계산됩니다. 현재는 실데이터 계산 준비 중입니다.';
+        } else if (settings.view === 'divergence') {
+          var pts = buildDivergence(data.joined || [], settings.period);
+          el.classList.remove('is-hidden');
+          el.textContent = pts.length
+            ? '괴리 구간 ' + pts.length + '곳을 마커로 표시했습니다 (샘플 기준).'
+            : '현재 구간에서 산출 가능한 괴리 지점이 없습니다. 가짜 수치를 표시하지 않습니다.';
+        } else {
+          el.classList.add('is-hidden');
+        }
+      }
+
+      function updateChartStatus() {
+        var el = document.getElementById('chartStatus');
+        if (!el) return;
+        var marketText = settings.market === 'NASDAQ' ? '나스닥' : '코스피';
+        var periodText = settings.period === 'all' ? '전체' : settings.period;
+        var modeText = data && data.summary ? (data.summary.dataMode || 'unavailable') : 'unavailable';
+        if (settings.market === 'NASDAQ') {
+          el.textContent = marketText + ' · 기간 ' + periodText + ' · 시장선 unavailable (나스닥 데이터 연동 전)';
+        } else {
+          el.textContent = marketText + ' · 기간 ' + periodText + ' · 데이터 ' + modeText;
+        }
+      }
+
+      function renderChart() {
+        var ctx = document.getElementById('mainChart');
+        if (!ctx || typeof Chart === 'undefined') return;
+        var built = buildChartData(data.joined || [], settings.period);
+        var labels = built.labels;
+        var fmData = built.fmData;
+        var marketData = marketSeriesFor(data.joined || [], settings.market);
+
+        var fmColor = cssVar('--fm') || '#6a4dff';
+        var marketColor = cssVar('--market') || '#e8930c';
+
+        var datasets = [
+          {
+            label: '펨코지수',
+            data: fmData,
+            borderColor: fmColor,
+            backgroundColor: hexToRgba(fmColor, 0.10),
+            yAxisID: 'y',
+            tension: 0.3,
+            fill: true,
+            spanGaps: false,
+            pointRadius: 0,
+          },
+          {
+            label: settings.market === 'NASDAQ' ? '나스닥 (미연동)' : '코스피 (정규화)',
+            data: marketData,
+            borderColor: marketColor,
+            backgroundColor: hexToRgba(marketColor, 0.10),
+            yAxisID: 'y1',
+            tension: 0.3,
+            fill: false,
+            spanGaps: false,
+            pointRadius: 0,
+          },
+        ];
+
+        if (settings.view === 'divergence') {
+          var pts = buildDivergence(data.joined || [], settings.period);
+          var colors = upDownColors(settings);
+          datasets.push({
+            label: '괴리 지점',
+            data: pts.map(function (p) { return { x: labels[p.x], y: p.y }; }),
+            type: 'scatter',
+            yAxisID: 'y',
+            backgroundColor: hexToRgba(colors.down, 0.9),
+            borderColor: colors.down,
+            pointRadius: 5,
+            showLine: false,
+          });
+        }
+
+        if (chart) chart.destroy();
+        chart = new Chart(ctx, {
+          type: 'line',
+          data: { labels: labels, datasets: datasets },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+              tooltip: {
+                callbacks: {
+                  label: function (item) {
+                    var d = built.source[item.dataIndex] || {};
+                    if (item.dataset.type === 'scatter') {
+                      return '괴리: 펨코 ' + item.parsed.y + ' · 시장변동 ' + d.marketChangeRate + '%';
+                    }
+                    var v = item.parsed.y;
+                    var s = item.dataset.label + ': ' + (v != null ? v.toFixed(2) : 'N/A');
+                    if (settings.market !== 'NASDAQ' && d.marketChangeRate != null) s += ' (변동 ' + d.marketChangeRate.toFixed(2) + '%)';
+                    if (d.postCount != null) s += ' | 게시글 ' + d.postCount;
+                    return s;
+                  },
+                },
+              },
+            },
+            scales: {
+              x: { ticks: { maxTicksLimit: 10, color: cssVar('--muted') }, grid: { color: 'transparent' } },
+              y: {
+                position: 'left', min: 0, max: 100,
+                title: { display: true, text: '펨코지수', color: fmColor },
+                ticks: { color: fmColor },
+              },
+              y1: {
+                position: 'right',
+                title: { display: true, text: '시장(정규화)', color: marketColor },
+                ticks: { color: marketColor },
+                grid: { drawOnChartArea: false },
+              },
             },
           },
-        },
-      },
-      scales: {
-        x: {
-          grid: { color: gridColor, drawBorder: false },
-          ticks: { color: muted, maxTicksLimit: 10, maxRotation: 0, font: { size: 10 } },
-        },
-        sentiment: {
-          position: "left",
-          min: 0,
-          max: 100,
-          grid: { color: gridColor, drawBorder: false },
-          ticks: { color: muted, stepSize: 25, font: { size: 10 } },
-          title: { display: true, text: "펨코지수", color: fmColor, font: { size: 10, weight: "600" } },
-        },
-        market: {
-          position: "right",
-          grid: { drawOnChartArea: false, drawBorder: false },
-          ticks: { color: muted, font: { size: 10 } },
-          title: { display: true, text: state.market, color: marketColor, font: { size: 10, weight: "600" } },
-        },
-      },
-    },
-  });
-}
+        });
+      }
 
-function renderAll() {
-  updateModeBadge();
-  updateCurrentIndex();
-  updateSessionPanel();
-  updateStatusPanel();
-  setText("marketLegendLabel", state.market === "KOSPI" ? "코스피" : "나스닥");
-  renderChart();
-}
+      function wireEvents() {
+        document.querySelectorAll('.tab, .mobile-nav button[data-section]').forEach(function (t) {
+          t.addEventListener('click', function () { switchSection(t.getAttribute('data-section')); });
+        });
 
-function setActiveButton(selector, dataKey, value) {
-  all(selector).forEach((button) => {
-    button.classList.toggle("is-active", button.dataset[dataKey] === value);
-    button.setAttribute("aria-pressed", String(button.dataset[dataKey] === value));
-  });
-}
+        document.querySelectorAll('[data-market]').forEach(function (b) {
+          b.addEventListener('click', function () {
+            settings.market = b.getAttribute('data-market');
+            setControl('data-market', 'data-market', settings.market);
+            render();
+          });
+        });
 
-function bindEvents() {
-  all("[data-section]").forEach((button) => button.addEventListener("click", () => showSection(button.dataset.section)));
+        document.querySelectorAll('[data-period]').forEach(function (b) {
+          b.addEventListener('click', function () {
+            settings.period = b.getAttribute('data-period');
+            setControl('data-period', 'data-period', settings.period);
+            render();
+          });
+        });
 
-  all("[data-market]").forEach((button) => button.addEventListener("click", () => {
-    state.market = button.dataset.market;
-    setActiveButton("[data-market]", "market", state.market);
-    renderAll();
-  }));
+        document.querySelectorAll('[data-view]').forEach(function (b) {
+          b.addEventListener('click', function () {
+            settings.view = b.getAttribute('data-view');
+            setControl('data-view', 'data-view', settings.view);
+            render();
+          });
+        });
 
-  all("[data-period]").forEach((button) => button.addEventListener("click", () => {
-    state.period = button.dataset.period;
-    setActiveButton("[data-period]", "period", state.period);
-    renderAll();
-  }));
+        var themeToggle = document.getElementById('themeToggle');
+        if (themeToggle) themeToggle.addEventListener('click', function () {
+          settings.theme = settings.theme === 'dark' ? 'light' : 'dark';
+          applyTheme(settings.theme);
+          saveSettings(window.localStorage, settings);
+          renderChart();
+        });
 
-  all("[data-view]").forEach((button) => button.addEventListener("click", () => {
-    state.view = button.dataset.view;
-    setActiveButton("[data-view]", "view", state.view);
-    renderChart();
-  }));
+        var settingsToggle = document.getElementById('settingsToggle');
+        var panel = document.getElementById('settingsPanel');
+        function setPanelOpen(open) {
+          if (!panel) return;
+          panel.classList.toggle('is-hidden', !open);
+          if (settingsToggle) settingsToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+          if (!open && settingsToggle) settingsToggle.focus();
+        }
+        if (settingsToggle && panel) settingsToggle.addEventListener('click', function () {
+          setPanelOpen(panel.classList.contains('is-hidden'));
+        });
+        document.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape' && panel && !panel.classList.contains('is-hidden')) {
+            setPanelOpen(false);
+          }
+        });
 
-  byId("themeToggle")?.addEventListener("click", () => applyTheme(state.theme === "light" ? "dark" : "light"));
+        var themeSelect = document.getElementById('themeSelect');
+        if (themeSelect) themeSelect.addEventListener('change', function () {
+          settings.theme = themeSelect.value;
+          applyTheme(settings.theme);
+          saveSettings(window.localStorage, settings);
+          renderChart();
+        });
 
-  const settingsPanel = byId("settingsPanel");
-  const settingsToggle = byId("settingsToggle");
-  const closeSettings = () => {
-    if (!settingsPanel) return;
-    settingsPanel.hidden = true;
-    settingsToggle?.setAttribute("aria-expanded", "false");
-  };
-  settingsToggle?.addEventListener("click", () => {
-    if (!settingsPanel) return;
-    settingsPanel.hidden = !settingsPanel.hidden;
-    settingsToggle.setAttribute("aria-expanded", String(!settingsPanel.hidden));
-  });
-  byId("settingsClose")?.addEventListener("click", closeSettings);
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeSettings();
-  });
+        var colorModeSelect = document.getElementById('colorModeSelect');
+        if (colorModeSelect) colorModeSelect.addEventListener('change', function () {
+          settings.colorMode = colorModeSelect.value;
+          applyColors();
+          saveSettings(window.localStorage, settings);
+          render();
+        });
 
-  all('input[name="colorMode"]').forEach((input) => input.addEventListener("change", () => applyColorMode(input.value)));
+        var cu = document.getElementById('customUpColor');
+        var cd = document.getElementById('customDownColor');
+        if (cu) cu.addEventListener('input', function () {
+          settings.customUp = cu.value;
+          if (settings.colorMode === 'custom') { applyColors(); saveSettings(window.localStorage, settings); render(); }
+        });
+        if (cd) cd.addEventListener('input', function () {
+          settings.customDown = cd.value;
+          if (settings.colorMode === 'custom') { applyColors(); saveSettings(window.localStorage, settings); render(); }
+        });
+      }
 
-  byId("riseColor")?.addEventListener("input", (event) => {
-    state.riseColor = event.target.value;
-    localStorage.setItem(STORAGE_KEYS.riseColor, state.riseColor);
-    if (state.colorMode === "custom") applyColorMode("custom");
-  });
-  byId("fallColor")?.addEventListener("input", (event) => {
-    state.fallColor = event.target.value;
-    localStorage.setItem(STORAGE_KEYS.fallColor, state.fallColor);
-    if (state.colorMode === "custom") applyColorMode("custom");
-  });
-}
+      function load() {
+        var params = readUrlParams();
+        Object.keys(params).forEach(function (k) { settings[k] = params[k]; });
+        applyTheme(settings.theme);
+        applyColors();
+        wireEvents();
+        switchSection('today');
+        fetch('/api/data.json')
+          .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+          .then(function (json) { data = json; render(); })
+          .catch(function (e) {
+            var el = document.getElementById('todayInterpretation');
+            if (el) el.textContent = '데이터를 불러오지 못했습니다. pipeline을 먼저 실행하세요. (' + e.message + ')';
+          });
+      }
 
-async function loadData() {
-  const response = await fetch("/api/data.json", { cache: "no-store" });
-  if (!response.ok) throw new Error(`데이터 요청 실패: ${response.status}`);
-  const payload = await response.json();
-  state.data = {
-    joined: Array.isArray(payload.joined) ? payload.joined : [],
-    overnight: payload.overnight || null,
-    summary: payload.summary || {},
-  };
-}
-
-async function boot() {
-  applyTheme(state.theme);
-  const riseInput = byId("riseColor");
-  const fallInput = byId("fallColor");
-  if (riseInput) riseInput.value = state.riseColor;
-  if (fallInput) fallInput.value = state.fallColor;
-  applyColorMode(state.colorMode);
-  bindEvents();
-
-  try {
-    await loadData();
-    renderAll();
-  } catch (error) {
-    console.error(error);
-    setText("chartStatus", "대시보드 데이터를 불러오지 못했습니다. pipeline을 먼저 실행하세요.");
-    setText("insightTitle", "데이터 연결을 확인해야 합니다.");
-    setText("insightBody", error instanceof Error ? error.message : "알 수 없는 오류");
-    updateSessionPanel();
-    updateStatusPanel();
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', load);
+      } else {
+        load();
+      }
+    })();
   }
-}
 
-document.addEventListener("DOMContentLoaded", boot);
+  /* ---------------- Public API (node tests) ---------------- */
+  return {
+    STORAGE_KEYS: STORAGE_KEYS,
+    COLOR_MODE_DEFAULTS: COLOR_MODE_DEFAULTS,
+    defaultSettings: defaultSettings,
+    readSettings: readSettings,
+    saveSettings: saveSettings,
+    readUrlParams: readUrlParams,
+    upDownColors: upDownColors,
+    filterByPeriod: filterByPeriod,
+    normalizeMarket: normalizeMarket,
+    marketSeriesFor: marketSeriesFor,
+    buildChartData: buildChartData,
+    buildDivergence: buildDivergence,
+    sentimentLabel: sentimentLabel,
+    sentimentClass: sentimentClass,
+    fmChangeText: fmChangeText,
+    escapeHtml: escapeHtml,
+    sampleBadgeVisible: sampleBadgeVisible,
+    interpretToday: interpretToday,
+    sessionPanelHtml: sessionPanelHtml,
+    directionMatchCardsHtml: directionMatchCardsHtml,
+  };
+});

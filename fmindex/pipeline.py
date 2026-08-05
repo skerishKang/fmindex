@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from .market.bridge import MarketBridge, MarketRecord
 from .fmkorea.parser import FMKoreaParser, ParsedPost
 from .llm.provider import LLMProvider, create_provider
-from .fmindex_calc import FMIndexCalculator, PostWithSentiment
+from .fmindex_calc import FMIndexCalculator, PostWithSentiment, METHODOLOGY_VERSION
 from .market_join import MarketSentimentJoiner
 from .dashboard.server import write_dashboard_files, serve_dashboard
 
@@ -201,6 +201,8 @@ def run_pipeline_once(
         "instrument": instrument_id,
         "symbol": symbol,
         "dataMode": data_mode,
+        "methodologyVersion": METHODOLOGY_VERSION,
+        "lastUpdated": datetime.now(KST).isoformat(),
     }
 
     # --- Step 7: Write output ---

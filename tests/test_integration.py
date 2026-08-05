@@ -987,7 +987,7 @@ class TestTimestampPeriodFilter:
         now = datetime.now(KST)
         data = [
             {
-                "timestamp": (now - timedelta(hours=1)).isoformat(),
+                "timestamp": now.isoformat(),
                 "fmIndex": 55.0,
                 "marketNormalized": 100.0,
             },
@@ -1006,7 +1006,7 @@ class TestTimestampPeriodFilter:
         now = datetime.now(KST)
         data = [
             {
-                "timestamp": (now - timedelta(days=1)).isoformat(),
+                "timestamp": now.isoformat(),
                 "fmIndex": 55.0,
                 "marketNormalized": 100.0,
             },
@@ -1024,7 +1024,7 @@ class TestTimestampPeriodFilter:
         now = datetime.now(KST)
         data = [
             {
-                "timestamp": (now - timedelta(days=15)).isoformat(),
+                "timestamp": now.isoformat(),
                 "fmIndex": 55.0,
                 "marketNormalized": 100.0,
             },
