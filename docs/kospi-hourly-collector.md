@@ -226,16 +226,43 @@ check applies only on the `read_kospi_records` / collector path.
 
 ### Strict time parsing (no fabrication)
 
-`cntr_tm` (HHMM or HHMMSS, KST) is the only time source. Missing,
-non-numeric, wrong-length, `HH>23`, `MM>59` values are rejected. A missing
+`cntr_tm` is the only time source. Supported formats:
+
+- **14 digits `YYYYMMDDHHMMSS`** — the live ka20005 response format
+  (e.g. `20260805150000`). The embedded date MUST equal the requested
+  `base_dt`; rows from other dates are rejected, never relabelled.
+- **6 digits `HHMMSS`** — legacy fixture compatibility.
+- **4 digits `HHMM`** — legacy fixture compatibility.
+
+Missing, non-numeric, wrong-length, whitespace-padded, `HH>23`,
+`MM>59`, `SS>59`, or invalid-date values are rejected. A missing
 `cntr_tm` is **never** replaced with a fabricated 09:00 timestamp.
 Out-of-session timestamps are rejected by the bucket rules.
 
 Counting semantics (no double counting):
 
 - `recordsReceived` — raw rows received from the API
+- `targetDateRows` / `otherDateRows` / `invalidTimestampRows` /
+  `invalidPriceRows` — detailed classification (no raw values)
 - `recordsRejected` — rows rejected during parse/time/session/contract checks
 - `recordsAccepted` — final hourly records
+
+### Signed OHLC price magnitudes
+
+Live ka20005 OHLC strings may carry a leading `+` or `-` direction sign.
+`open_pric`/`high_pric`/`low_pric`/`cur_prc` are parsed with
+`_parse_price_magnitude`: the absolute finite magnitude is used, and
+zero/negative magnitudes, `NaN`, `Infinity`, and multi/mixed signs are
+rejected. `trde_qty` uses `_parse_nonnegative_number` — a negative volume
+is invalid (never abs-normalized), and `acc_trde_qty` (cumulative) is
+never used as per-candle volume.
+
+### Exact KOSPI identity
+
+`_is_valid_kospi_record` requires exact matches only (no substring
+search): `provider == "kiwoom"`, `instrumentId == "001"`,
+`symbol == "KOSPI"`, `market == "KOSPI"`, `assetType == "index"`,
+`dataMode == "real"`. Anything else is rejected.
 
 ### Volume policy
 
