@@ -19,7 +19,12 @@ function Test-CommandVersion {
     }
 
     try {
-        return (& $VersionCommand).Trim()
+        $output = & $VersionCommand 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $failures.Add("Could not read $Name version: exit code $LASTEXITCODE")
+            return $null
+        }
+        return $output.Trim()
     } catch {
         $failures.Add("Could not read $Name version: $($_.Exception.Message)")
         return $null
@@ -60,10 +65,11 @@ if ($pythonVersion) {
 if ($pythonVersion) {
     try {
         $pytestCheck = python -c "import pytest; print(pytest.__version__)" 2>&1
-        if ($pytestCheck) {
-            Write-Host "  pytest: $pytestCheck"
+        $pytestExit = $LASTEXITCODE
+        if ($pytestExit -ne 0) {
+            $failures.Add("pytest import check failed (exit $pytestExit): $pytestCheck")
         } else {
-            $failures.Add('pytest is not installed. Run: pip install -e ".[dev]"')
+            Write-Host "  pytest: $pytestCheck"
         }
     } catch {
         $failures.Add('pytest import check failed: ' + $_.Exception.Message)
@@ -74,10 +80,11 @@ if ($pythonVersion) {
 if ($pythonVersion) {
     try {
         $fmindexCheck = python -c "import fmindex; print(fmindex.__version__)" 2>&1
-        if ($fmindexCheck) {
-            Write-Host "  fmindex: v$fmindexCheck"
+        $fmindexExit = $LASTEXITCODE
+        if ($fmindexExit -ne 0) {
+            $failures.Add("fmindex import check failed (exit $fmindexExit): $fmindexCheck")
         } else {
-            $failures.Add('fmindex import check failed.')
+            Write-Host "  fmindex: v$fmindexCheck"
         }
     } catch {
         $failures.Add('fmindex import check failed: ' + $_.Exception.Message)
