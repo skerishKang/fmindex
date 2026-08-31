@@ -41,34 +41,13 @@ class BudgetExhaustedError(RuntimeError):
     """Raised when the hard HTTP request budget is fully consumed."""
 
 
-@dataclass(frozen=True)
 class BudgetGate:
-    """Shared hard upper-bound gate for actual transport invocations.
+    """Hard upper-bound gate for actual transport invocations.
 
     Every call to ``consume()`` deducts one unit. When the remaining
     budget reaches zero, the next call raises ``BudgetExhaustedError``
     so that pagination and retry loops cannot exceed the configured
     hard limit on actual HTTP transport invocations.
-    """
-
-    budget: int
-
-    def consume(self) -> None:
-        if self.budget <= 0:
-            raise BudgetExhaustedError(
-                f"Hard HTTP request budget exhausted ({self.budget} remaining). "
-                "Stopping."
-            )
-        # frozen dataclass: cannot mutate in-place. Caller must use a mutable
-        # wrapper or the gate is consumed once and never reused. See KiwoomClient
-        # usage below where a mutable budget counter is preferred for runtime
-        # deduction; this frozen variant exists for explicit one-shot gates.
-
-
-class MutableBudgetGate:
-    """Mutable hard upper-bound gate for actual transport invocations.
-
-    Thread-unsafe; sufficient for the single-threaded collector client.
     """
 
     def __init__(self, budget: int) -> None:
@@ -174,7 +153,7 @@ class KiwoomClient:
         retry_backoff: float = 1.0,
         timeout: float = 15.0,
         transport: Optional[Transport] = None,
-        budget_gate: Optional[MutableBudgetGate] = None,
+        budget_gate: Optional[BudgetGate] = None,
     ) -> None:
         self.token_manager = token_manager or KiwoomTokenManager()
         self.base_url = (base_url or self.token_manager.base_url).rstrip("/")
@@ -220,12 +199,15 @@ class KiwoomClient:
 
         last_error: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
-            # Each transport invocation (including retries) consumes budget.
-            if self.budget_gate is not None:
-                self.budget_gate.consume()
             try:
-                response = self._transport(url, body, headers)
+                # Hard budget gate: consume BEFORE each transport call,
+                # and increment requests_made at the same point so that
+                # failed attempts (timeout/URLError) are counted just like
+                # successful ones — both are real HTTP transport invocations.
+                if self.budget_gate is not None:
+                    self.budget_gate.consume()
                 self.requests_made += 1
+                response = self._transport(url, body, headers)
                 self._validate_envelope(response.body, api_id)
                 return response
             except KiwoomRateLimitError:

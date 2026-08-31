@@ -544,7 +544,11 @@ class TestHardRequestBudget:
         assert len(transport.calls) == 2
 
     def test_retry_consumes_budget(self):
-        """Transient failure + success: both calls consume budget."""
+        """Transient failure + success: both calls consume budget.
+
+        Failed transport calls count toward requests_made (the accounting
+        point is right before _transport, not after a successful return).
+        """
         page = make_minute_page(
             [minute_row("0900", 3200, 3210, 3190, 3205)],
             cont_yn="N",
@@ -564,7 +568,9 @@ class TestHardRequestBudget:
         collector = KospiCollector(client=client, config=config, request_delay=0.0)
         records = collector.collect_day("2026-08-05")
         assert len(records) == 1
-        assert call_count[0] == 2  # retry consumed 2 budget slots
+        assert call_count[0] == 2  # both attempts are real transport calls
+        assert client.requests_made == 2  # failed call counted in requests_made
+        assert collector.requests_made == 2  # parity at collector level
 
     def test_retry_budget_exhaustion_fails_closed(self):
         """max_requests=1 + transient failure → 1 call, then fail closed
@@ -643,6 +649,53 @@ class TestHardRequestBudget:
         with pytest.raises(KiwoomRateLimitError):
             collector.collect_range("2026-08-05", "2026-08-06")
         assert len(transport.calls) == 1  # only 1 transport call total
+
+    def test_two_day_max_requests_2_both_fetched(self, monkeypatch, tmp_path):
+        """Two trading days with budget=2, 1 page per day -> both days fetched."""
+        import fmindex.market.kospi_collector as kc_mod
+        monkeypatch.setenv("KIWOOM_APPKEY", "app")
+        monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
+        monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
+        # Each day's fetch returns exactly one page (no pagination).
+        # With max_requests=2, both days should succeed: 1 HTTP call each.
+        page = make_minute_page(
+            [minute_row("0900", 3200, 3210, 3190, 3205)],
+            cont_yn="N",
+        )
+        transport = FakeTransport(responses=[page, page])
+        client = make_client(transport=transport)
+        config = CollectorConfig(
+            from_date="2026-08-05", to_date="2026-08-06",
+            max_requests=2,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=client, config=config, request_delay=0.0)
+        records = collector.collect_range("2026-08-05", "2026-08-06")
+        assert len(records) == 2  # one record per day
+        assert len(transport.calls) == 2  # one HTTP call per trading day
+        assert collector.requests_made == 2
+        # Budget must be fully consumed (no unused budget left).
+        assert client.budget_gate.budget == 0
+
+    def test_weekend_no_budget_consumption(self, monkeypatch, tmp_path):
+        """Weekend range: no trading days → zero transport calls."""
+        import fmindex.market.kospi_collector as kc_mod
+        monkeypatch.setenv("KIWOOM_APPKEY", "app")
+        monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
+        monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
+        transport = FakeTransport()
+        client = make_client(transport=transport)
+        config = CollectorConfig(
+            from_date="2026-08-08", to_date="2026-08-09",  # Sat-Sun
+            max_requests=10,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=client, config=config, request_delay=0.0)
+        records = collector.collect_range("2026-08-08", "2026-08-09")
+        assert len(records) == 0
+        assert len(transport.calls) == 0  # no HTTP calls for non-trading days
 
 
 # --------------------------------------------------------------------------- #
