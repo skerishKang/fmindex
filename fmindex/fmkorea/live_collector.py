@@ -20,13 +20,11 @@ Outputs:
 
 from __future__ import annotations
 
-import json
-import re
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -54,17 +52,6 @@ MIN_REQUEST_DELAY = 3.0
 MAX_LIST_BOUNDS = 1
 MAX_POSTS_BOUNDS = 3
 MAX_COMMENT_BOUNDS = 1
-
-#: Relative-time regex — never treated as an absolute published datetime.
-_RELATIVE_TIME_RE = re.compile(
-    r"^(방금|몇 분 전|분 전|시간 전|어제|오늘|내일|[0-9]+일 전|[0-9]+시간 전|[0-9]+분 전|[0-9]+초 전)\s*$",
-    re.UNICODE,
-)
-
-#: ISO 8601 datetime pattern for validated absolute published dates.
-_ISO_DATETIME_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:?\d{2}|Z)?)?$",
-)
 
 #: CAPTCHA / security-check page markers.
 _CAPTCHA_RE = ("captcha", "reCAPTCHA", "g-recaptcha", "security check", "자동입력방지")
@@ -185,6 +172,7 @@ class LiveFMKoreaCollector:
         # --- Counters --------------------------------------------------- #
         self.requests_made = 0
         self.robots_calls = 0
+        self.list_calls = 0
         self.content_calls = 0
         self.robots_status = ""
         self.robots_allows_stock = True
@@ -263,6 +251,13 @@ class LiveFMKoreaCollector:
             raise FMKoreaRequestBudgetExceeded("robots budget exhausted")
         result = self._fetch(ROBOTS_URL, "robots")
         self.robots_calls += 1
+        # Abort immediately on forbidden/rate_limited/captcha — same as any other endpoint.
+        if result.status == "forbidden":
+            raise FMKoreaForbiddenError("HTTP 403 on robots.txt")
+        if result.status == "rate_limited":
+            raise FMKoreaRateLimitError("HTTP 429 on robots.txt")
+        if result.status == "captcha":
+            raise FMKoreaCaptchaError("CAPTCHA on robots.txt")
         body = result.html.lower()
         self.robots_status = result.status
         if result.status != "ok" or not body:
@@ -278,16 +273,21 @@ class LiveFMKoreaCollector:
     # -- list --------------------------------------------------------------- #
     def fetch_list(self, raw_dir: Path) -> List[LivePost]:
         """Fetch the board list once and return post stubs."""
+        if self.list_calls >= self.max_list:
+            raise FMKoreaRequestBudgetExceeded("list budget exhausted")
         result = self._fetch_content(BOARD_URL, "list")
+        self.list_calls += 1
         self.list_status = result.status
-        if result.status in ("forbidden", "client_error", "server_error", "rate_limited", "unexpected_content"):
-            raise FMKoreaUnexpectedContentError(f"board list: {result.status}")
+        if result.status == "forbidden":
+            raise FMKoreaForbiddenError("HTTP 403 on board list")
+        if result.status == "rate_limited":
+            raise FMKoreaRateLimitError("HTTP 429 on board list")
         if result.status == "captcha":
             raise FMKoreaCaptchaError("CAPTCHA on board list")
         if result.status == "deleted":
             raise FMKoreaDeletedPostError("board list returned deleted")
-        if result.status == "network_error":
-            raise FMKoreaUnexpectedContentError("network error on board list")
+        if result.status in ("client_error", "server_error", "unexpected_content", "network_error"):
+            raise FMKoreaUnexpectedContentError(f"board list: {result.status}")
         if self.save_raw:
             raw_dir.mkdir(parents=True, exist_ok=True)
             (raw_dir / "list.html").write_text(result.html, encoding="utf-8")
@@ -306,19 +306,25 @@ class LiveFMKoreaCollector:
             result = self._fetch_content(url, f"post-{i}")
             if result.status == "network_error":
                 raise FMKoreaUnexpectedContentError(f"network error on post {stub.sourcePostId}")
-            if result.status in ("forbidden", "client_error", "server_error", "rate_limited", "unexpected_content"):
-                raise FMKoreaUnexpectedContentError(f"HTTP {result.http_status} on post {stub.sourcePostId}")
+            if result.status == "forbidden":
+                raise FMKoreaForbiddenError(f"HTTP 403 on post detail {stub.sourcePostId}")
+            if result.status == "rate_limited":
+                raise FMKoreaRateLimitError(f"HTTP 429 on post detail {stub.sourcePostId}")
             if result.status == "captcha":
                 raise FMKoreaCaptchaError("CAPTCHA on post detail")
             if result.status == "deleted":
                 # Counter already incremented by _fetch() — do NOT increment again.
                 continue
+            if result.status in ("client_error", "server_error", "unexpected_content"):
+                raise FMKoreaUnexpectedContentError(f"HTTP {result.http_status} on post {stub.sourcePostId}")
             if self.save_raw:
                 (raw_dir / f"post-{i}.html").write_text(result.html, encoding="utf-8")
             post = parse_live_post(result.html, source_post_id=stub.sourcePostId)
             if post is None:
-                # Counter already incremented by _fetch() as unexpected_content — do NOT increment again.
+                self.unexpected_content += 1
                 continue
+            if post.deleted:
+                self.deleted_posts += 1
             post.firstSeenAt = stub.firstSeenAt
             self.comments_parsed += len(post.comments)
             self.replies_parsed += sum(1 for c in post.comments if c.depth >= 1)

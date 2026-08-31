@@ -5,10 +5,15 @@ from pathlib import Path
 import pytest
 
 from fmindex.fmkorea.live_collector import (
+    FMKoreaCaptchaError,
+    FMKoreaDeletedPostError,
+    FMKoreaForbiddenError,
+    FMKoreaRateLimitError,
+    FMKoreaRequestBudgetExceeded,
     FMKoreaSafetyValidationError,
     FMKoreaUnexpectedContentError,
-    FetchResult,
     LiveFMKoreaCollector,
+    FetchResult,
 )
 from fmindex.fmkorea.live_parser import parse_live_post
 from fmindex.fmkorea.live_models import LivePost
@@ -227,7 +232,7 @@ class TestHttp429ZeroRetryBudget:
     def test_429_zero_retry_single_transport_call(self, tmp_path):
         transport = FakeTransport([FetchResult(status="rate_limited", http_status=429)])
         collector = LiveFMKoreaCollector(transport=transport)
-        with pytest.raises(FMKoreaUnexpectedContentError):
+        with pytest.raises(FMKoreaRateLimitError):
             collector.fetch_list(tmp_path)
         assert len(transport.calls) == 1
         assert collector.http_429 == 1
@@ -235,7 +240,7 @@ class TestHttp429ZeroRetryBudget:
     def test_429_content_calls_increments(self, tmp_path):
         transport = FakeTransport([FetchResult(status="rate_limited", http_status=429)])
         collector = LiveFMKoreaCollector(transport=transport)
-        with pytest.raises(FMKoreaUnexpectedContentError):
+        with pytest.raises(FMKoreaRateLimitError):
             collector.fetch_list(tmp_path)
         # content_calls counts the actual transport call even on abort
         assert collector.content_calls == 1
@@ -253,7 +258,7 @@ class TestContentTypeFailureAborts:
     def test_401_aborts_list(self, tmp_path):
         transport = FakeTransport([FetchResult(status="forbidden", http_status=401)])
         collector = LiveFMKoreaCollector(transport=transport)
-        with pytest.raises(FMKoreaUnexpectedContentError):
+        with pytest.raises(FMKoreaForbiddenError):
             collector.fetch_list(tmp_path)
 
     def test_500_aborts_list(self, tmp_path):
@@ -267,3 +272,113 @@ class TestContentTypeFailureAborts:
         collector = LiveFMKoreaCollector(transport=transport)
         with pytest.raises(FMKoreaUnexpectedContentError):
             collector.fetch_list(tmp_path)
+
+
+
+class TestRobotsFailClosed:
+    """Robots endpoint must abort on forbidden/rate_limited/captcha."""
+
+    def test_robots_429_aborts(self):
+        transport = FakeTransport([FetchResult(status="rate_limited", http_status=429)])
+        collector = LiveFMKoreaCollector(transport=transport)
+        with pytest.raises(FMKoreaRateLimitError):
+            collector.check_robots()
+        assert len(transport.calls) == 1
+        assert collector.http_429 == 1
+
+    def test_robots_403_aborts(self):
+        transport = FakeTransport([FetchResult(status="forbidden", http_status=403)])
+        collector = LiveFMKoreaCollector(transport=transport)
+        with pytest.raises(FMKoreaForbiddenError):
+            collector.check_robots()
+        assert len(transport.calls) == 1
+        assert collector.http_403 == 1
+
+    def test_robots_captcha_aborts(self):
+        transport = FakeTransport([FetchResult(status="captcha", html="<html>CAPTCHA</html>", http_status=200)])
+        collector = LiveFMKoreaCollector(transport=transport)
+        with pytest.raises(FMKoreaCaptchaError):
+            collector.check_robots()
+        assert len(transport.calls) == 1
+        assert collector.captcha_count == 1
+
+    def test_robots_network_error_unresolved(self):
+        transport = FakeTransport([FetchResult(status="network_error")])
+        collector = LiveFMKoreaCollector(transport=transport)
+        result = collector.check_robots()
+        assert result == "unresolved"
+
+
+class TestMaxListBoundary:
+    """max_list=0 blocks all list requests; max_list=1 allows one."""
+
+    def test_max_list_zero_blocks_transport(self):
+        transport = FakeTransport([])
+        collector = LiveFMKoreaCollector(transport=transport, max_list=0)
+        with pytest.raises(FMKoreaRequestBudgetExceeded):
+            collector.fetch_list(Path('/tmp'))
+        assert len(transport.calls) == 0
+        assert collector.list_calls == 0
+
+    def test_max_list_one_allowed_then_blocked(self):
+        transport = FakeTransport(["<html></html>"])
+        collector = LiveFMKoreaCollector(transport=transport, max_list=1)
+        # First call should succeed
+        collector.fetch_list(Path('/tmp'))
+        assert collector.list_calls == 1
+        assert len(transport.calls) == 1
+        # Second call should be blocked before transport
+        with pytest.raises(FMKoreaRequestBudgetExceeded):
+            collector.fetch_list(Path('/tmp'))
+        assert len(transport.calls) == 1  # no additional calls
+
+
+class TestDatetimeValidation:
+    """publishedAt must only accept timezone-aware ISO 8601 datetimes."""
+
+    def test_valid_datetime_with_offset(self):
+        from fmindex.fmkorea.live_parser import _validate_absolute_datetime
+        result = _validate_absolute_datetime("2026-08-05T09:15:00+09:00")
+        assert result == "2026-08-05T09:15:00+09:00"
+
+    def test_valid_zulu_datetime(self):
+        from fmindex.fmkorea.live_parser import _validate_absolute_datetime
+        result = _validate_absolute_datetime("2026-08-05T00:15:00Z")
+        assert result == "2026-08-05T00:15:00Z"
+
+    def test_relative_korean_rejected(self):
+        from fmindex.fmkorea.live_parser import _validate_absolute_datetime
+        assert _validate_absolute_datetime("3분 전") is None
+        assert _validate_absolute_datetime("방금") is None
+        assert _validate_absolute_datetime("어제") is None
+        assert _validate_absolute_datetime("오늘") is None
+        assert _validate_absolute_datetime("몇 시간 전") is None
+
+    def test_date_only_rejected(self):
+        from fmindex.fmkorea.live_parser import _validate_absolute_datetime
+        # Date-only without time or timezone should be rejected
+        assert _validate_absolute_datetime("2026-08-05") is None
+
+    def test_time_only_without_tz_rejected(self):
+        from fmindex.fmkorea.live_parser import _validate_absolute_datetime
+        # Time-only without timezone is naive -> rejected
+        assert _validate_absolute_datetime("2026-08-05T09:15") is None
+
+    def test_malformed_string_rejected(self):
+        from fmindex.fmkorea.live_parser import _validate_absolute_datetime
+        assert _validate_absolute_datetime("not-a-date") is None
+        assert _validate_absolute_datetime("") is None
+        assert _validate_absolute_datetime(None) is None
+
+    def test_parser_accepts_valid_datetime_attr(self):
+        post = parse_live_post(read_fixture("live-post-sanitized.html"), source_post_id="123456780")
+        assert post is not None
+        assert post.publishedAt
+        assert "+09:00" in post.publishedAt
+
+    def test_parser_rejects_relative_display_text(self):
+        post = parse_live_post(read_fixture("live-relative-time-sanitized.html"), source_post_id="999999")
+        assert post is not None
+        assert post.publishedAt is None or post.publishedAt == ""
+        assert post.firstSeenAt  # firstSeenAt should still be populated
+        assert post.publishedAt != post.firstSeenAt

@@ -243,14 +243,14 @@ class TestCollectorBudgetAndPolicy:
     def test_403_aborts(self, tmp_path):
         transport = FakeTransport([FetchResult(status="forbidden", http_status=403)])
         collector = LiveFMKoreaCollector(transport=transport)
-        with pytest.raises(FMKoreaUnexpectedContentError):
+        with pytest.raises(FMKoreaForbiddenError):
             collector.fetch_list(tmp_path)
         assert collector.http_403 == 1
 
     def test_429_aborts_zero_retry(self, tmp_path):
         transport = FakeTransport([FetchResult(status="rate_limited", http_status=429)])
         collector = LiveFMKoreaCollector(transport=transport)
-        with pytest.raises(FMKoreaUnexpectedContentError):
+        with pytest.raises(FMKoreaRateLimitError):
             collector.fetch_list(tmp_path)
         assert collector.http_429 == 1
         assert len(transport.calls) == 1  # no retry
