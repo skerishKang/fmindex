@@ -69,7 +69,7 @@ from .kiwoom_client import (
     KiwoomRateLimitError,
     KiwoomAPIError,
     KiwoomResponse,
-    MutableBudgetGate,
+    BudgetGate,
 )
 
 #: Official endpoint paths (confirmed contract).
@@ -203,7 +203,7 @@ class KospiCollector:
         self.request_delay = request_delay
         # Shared hard budget gate — pagination and retry both consume from it.
         if config is not None:
-            self._budget_gate = MutableBudgetGate(config.max_requests)
+            self._budget_gate = BudgetGate(config.max_requests)
             self.client.budget_gate = self._budget_gate
         else:
             self._budget_gate = None
@@ -262,7 +262,6 @@ class KospiCollector:
                     # adds an explicit cross-day pacing knob.
                     time.sleep(self.request_delay)
             day += timedelta(days=1)
-            self._check_request_budget()
 
         return sorted(records.values(), key=lambda r: r.timestamp)
 
@@ -628,11 +627,12 @@ class KospiCollector:
             raise KiwoomRateLimitError(
                 f"Max requests reached ({limit}). Stopping collection."
             )
-        if self._budget_gate is not None:
-            try:
-                self._budget_gate.consume()
-            except BudgetExhaustedError as exc:
-                raise KiwoomRateLimitError(str(exc)) from exc
+        # Budget gate is a read-only check here — consumption happens at the
+        # transport invocation point in KiwoomClient.fetch().
+        if self._budget_gate is not None and self._budget_gate.budget <= 0:
+            raise KiwoomRateLimitError(
+                "Hard HTTP request budget exhausted. Stopping collection."
+            )
 
     @staticmethod
     def _float(value: Any) -> Optional[float]:
@@ -1011,6 +1011,7 @@ def main() -> None:
         KiwoomRateLimitError,
         KiwoomAPIError,
         KiwoomPaginationError,
+        BudgetExhaustedError,
         NoTradingDaysError,
     ) as e:
         print(f"ERROR: {e}", file=sys.stderr)
