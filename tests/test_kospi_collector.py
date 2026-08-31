@@ -1839,40 +1839,49 @@ class TestCalendarScope:
         assert dt.weekday() == 4  # Friday
         assert is_trading_day(dt) is False
 
-    def test_nationwide_election_day_closed(self):
-        """2026-06-01 (Local Election Day) is NOT a trading day."""
-        dt = datetime(2026, 6, 1, 10, 0, tzinfo=KST)
-        assert dt.weekday() == 0  # Monday
+    def test_election_day_closed(self):
+        """2026-06-03 (9th Local Election Day) is NOT a trading day."""
+        dt = datetime(2026, 6, 3, 10, 0, tzinfo=KST)
+        assert dt.weekday() == 2  # Tuesday
         assert is_trading_day(dt) is False
 
-    def test_end_of_term_closure_closed(self):
-        """2026-06-30 (End-of-term special closure) is NOT a trading day."""
+    def test_hangugjeol_closed(self):
+        """2026-07-17 (Constitution Day) is NOT a trading day."""
+        dt = datetime(2026, 7, 17, 10, 0, tzinfo=KST)
+        assert dt.weekday() == 4  # Friday
+        assert is_trading_day(dt) is False
+
+    def test_year_end_closure(self):
+        """2026-12-31 (year-end market closure) is NOT a trading day."""
+        dt = datetime(2026, 12, 31, 10, 0, tzinfo=KST)
+        assert dt.weekday() == 3  # Thursday
+        assert is_trading_day(dt) is False
+
+    def test_positive_trading_day_june_30(self):
+        """2026-06-30 must remain a trading day (not over-closed)."""
         dt = datetime(2026, 6, 30, 10, 0, tzinfo=KST)
         assert dt.weekday() == 1  # Tuesday
-        assert is_trading_day(dt) is False
+        assert is_trading_day(dt) is True
 
-    def test_year_end_closure_closed(self):
-        """2026-12-28~31 are NOT trading days (year-end settlement)."""
-        for day in (28, 29, 30, 31):
-            dt = datetime(2026, 12, day, 10, 0, tzinfo=KST)
-            assert is_trading_day(dt) is False, f"2026-12-{day:02d} should be closed"
+    def test_positive_trading_day_dec_30(self):
+        """2026-12-30 must remain a trading day (not over-closed)."""
+        dt = datetime(2026, 12, 30, 10, 0, tzinfo=KST)
+        assert dt.weekday() == 2  # Wednesday
+        assert is_trading_day(dt) is True
 
     def test_year_end_closure_dow_check(self):
-        """Verify weekday positions for year-end closure dates."""
-        # 12/28 Mon, 12/29 Tue, 12/30 Wed, 12/31 Thu
-        assert datetime(2026, 12, 28, tzinfo=KST).weekday() == 0
-        assert datetime(2026, 12, 29, tzinfo=KST).weekday() == 1
+        """Verify weekday positions for year-end boundary dates."""
+        # 12/30 Wed, 12/31 Thu
         assert datetime(2026, 12, 30, tzinfo=KST).weekday() == 2
         assert datetime(2026, 12, 31, tzinfo=KST).weekday() == 3
 
-    def test_trading_day_request_plan_excludes_labor_day(self, monkeypatch, tmp_path):
-        """Labor Day must NOT appear in requestedDates for a valid plan."""
+    def test_request_plan_excludes_all_krx_closures(self, monkeypatch, tmp_path):
+        """Labor Day, Election Day, and Hangugjeol must NOT appear in requestedDates."""
         monkeypatch.setenv("KIWOOM_APPKEY", "app")
         monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
         monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
-        import fmindex.market.kospi_collector as kc_mod
         config = CollectorConfig(
-            from_date="2026-04-27", to_date="2026-05-05", dry_run=True,
+            from_date="2026-04-27", to_date="2026-07-25", dry_run=True,
             output=str(tmp_path / "out.jsonl"),
             metadata_output=str(tmp_path / "out.meta.json"),
         )
@@ -1880,15 +1889,20 @@ class TestCalendarScope:
         assert result.get("dryRun") is True
         requested = result.get("requestedDates", [])
         assert "2026-05-01" not in requested, "Labor Day must not be in request plan"
+        assert "2026-06-03" not in requested, "Election Day must not be in request plan"
+        assert "2026-07-17" not in requested, "Hangugjeol must not be in request plan"
+        # Verify that regular trading days are actually included
+        assert "2026-06-30" in requested, "2026-06-30 should be a trading day in plan"
+        assert "2026-07-16" in requested, "2026-07-16 should be a trading day in plan"
 
     def test_holiday_only_range_returns_no_trading_days(self, monkeypatch, tmp_path):
-        """A range containing ONLY holidays returns NO_TRADING_DAYS."""
+        """A range containing ONLY a single KRX closure returns NO_TRADING_DAYS."""
         monkeypatch.setenv("KIWOOM_APPKEY", "app")
         monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
         monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
-        # 2026-12-28 to 2026-12-31: all year-end closures
+        # 2026-12-31 alone: year-end closure
         config = CollectorConfig(
-            from_date="2026-12-28", to_date="2026-12-31",
+            from_date="2026-12-31", to_date="2026-12-31",
             output=str(tmp_path / "out.jsonl"),
             metadata_output=str(tmp_path / "out.meta.json"),
         )
