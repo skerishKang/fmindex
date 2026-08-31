@@ -243,14 +243,14 @@ class TestCollectorBudgetAndPolicy:
     def test_403_aborts(self, tmp_path):
         transport = FakeTransport([FetchResult(status="forbidden", http_status=403)])
         collector = LiveFMKoreaCollector(transport=transport)
-        with pytest.raises(FMKoreaForbiddenError):
+        with pytest.raises(FMKoreaUnexpectedContentError):
             collector.fetch_list(tmp_path)
         assert collector.http_403 == 1
 
     def test_429_aborts_zero_retry(self, tmp_path):
         transport = FakeTransport([FetchResult(status="rate_limited", http_status=429)])
         collector = LiveFMKoreaCollector(transport=transport)
-        with pytest.raises(FMKoreaRateLimitError):
+        with pytest.raises(FMKoreaUnexpectedContentError):
             collector.fetch_list(tmp_path)
         assert collector.http_429 == 1
         assert len(transport.calls) == 1  # no retry
@@ -276,8 +276,8 @@ class TestCollectorBudgetAndPolicy:
         transport = FakeTransport(
             [FetchResult(status="ok", html="<html></html>", http_status=200)] * 20
         )
-        collector = LiveFMKoreaCollector(transport=transport, max_posts=10)
-        collector.content_calls = 4  # simulate prior calls
+        collector = LiveFMKoreaCollector(transport=transport, max_posts=3)
+        collector.content_calls = 5  # exactly at limit — next call triggers budget exceeded
         stubs = [LivePost(sourcePostId=f"1{i:06d}", canonicalUrl=f"/1{i:06d}", title=f"p{i}") for i in range(5)]
         with pytest.raises(FMKoreaRequestBudgetExceeded):
             collector.fetch_posts(stubs, tmp_path)
