@@ -51,6 +51,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
       - name: Run pytest via pnpm test
         run: pnpm test
 
@@ -64,16 +74,6 @@ jobs:
         run: |
           python -m pip install --target /tmp/fmindex_smoke dist/*.whl
           python -c "import sys; sys.path.insert(0, '/tmp/fmindex_smoke'); import fmindex; print(f'fmindex {fmindex.__version__} imported OK')"
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 11
 
       - name: Run doctor checks
         run: pwsh -NoProfile -File ./scripts/doctor.ps1
