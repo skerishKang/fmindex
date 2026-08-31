@@ -40,6 +40,7 @@ from fmindex.market.kiwoom_auth import (
     load_credentials,
 )
 from fmindex.market.kiwoom_client import (
+    BudgetExhaustedError,
     KiwoomAPIError,
     KiwoomClient,
     KiwoomPaginationError,
@@ -470,6 +471,178 @@ class TestHttpClient:
 
         with pytest.raises(KiwoomPaginationError):
             client.fetch_all("ka20005", "/api/dostk/chart", {}, max_pages=3)
+
+
+# --------------------------------------------------------------------------- #
+# HARD HTTP REQUEST BUDGET / ISSUE #12                                         #
+# --------------------------------------------------------------------------- #
+
+
+class TestHardRequestBudget:
+    """Hard HTTP request budget enforcement per Issue #12.
+
+    max_requests=N limits actual _transport invocations (including
+    pagination and retry), not just page counts.
+    """
+
+    def test_max_requests_0_no_transport_calls(self):
+        """max_requests=0 → 0 transport calls, fail closed."""
+        page = make_minute_page(
+            [minute_row("0900", 3200, 3210, 3190, 3205)],
+            cont_yn="N",
+        )
+        transport = FakeTransport(responses=[page])
+        client = make_client(transport=transport)
+        config = CollectorConfig(
+            from_date="2026-08-05", to_date="2026-08-05",
+            max_requests=0,
+        )
+        collector = KospiCollector(client=client, config=config, request_delay=0.0)
+        with pytest.raises((KiwoomRateLimitError, BudgetExhaustedError)):
+            collector.collect_day("2026-08-05")
+        assert len(transport.calls) == 0
+
+    def test_max_requests_1_pagination_stops_after_first(self):
+        """max_requests=1 with continuation → only 1 transport call;
+        page 2 is NEVER fetched."""
+        # Page 1 says cont_yn=Y with next-key → pagination would continue
+        page1 = make_minute_page(
+            [minute_row("0900", 3200, 3210, 3190, 3205)],
+            cont_yn="Y", next_key="abc",
+        )
+        pages = [page1]
+        transport = FakeTransport(responses=pages)
+        client = make_client(transport=transport)
+        config = CollectorConfig(
+            from_date="2026-08-05", to_date="2026-08-05",
+            max_requests=1,
+        )
+        collector = KospiCollector(client=client, config=config, request_delay=0.0)
+        with pytest.raises((BudgetExhaustedError, KiwoomRateLimitError)):
+            collector.collect_day("2026-08-05")
+        assert len(transport.calls) == 1
+
+    def test_max_requests_2_pagination_consumes_both(self):
+        """max_requests=2 with 2 continuation pages → consumes exactly 2."""
+        page1 = make_minute_page(
+            [minute_row("0900", 3200, 3210, 3190, 3205)],
+            cont_yn="Y", next_key="k1",
+        )
+        page2 = make_minute_page(
+            [minute_row("1000", 3210, 3220, 3200, 3215)],
+            cont_yn="N",
+        )
+        transport = FakeTransport(responses=[page1, page2])
+        client = make_client(transport=transport)
+        config = CollectorConfig(
+            from_date="2026-08-05", to_date="2026-08-05",
+            max_requests=2,
+        )
+        collector = KospiCollector(client=client, config=config, request_delay=0.0)
+        records = collector.collect_day("2026-08-05")
+        assert len(records) == 2  # 09:00 and 10:00 buckets
+        assert len(transport.calls) == 2
+
+    def test_retry_consumes_budget(self):
+        """Transient failure + success: both calls consume budget."""
+        page = make_minute_page(
+            [minute_row("0900", 3200, 3210, 3190, 3205)],
+            cont_yn="N",
+        )
+        call_count = [0]
+        def counting_transport(url, body, headers):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise TimeoutError("simulated timeout")
+            return page
+
+        client = make_client(transport=counting_transport)
+        config = CollectorConfig(
+            from_date="2026-08-05", to_date="2026-08-05",
+            max_requests=2,
+        )
+        collector = KospiCollector(client=client, config=config, request_delay=0.0)
+        records = collector.collect_day("2026-08-05")
+        assert len(records) == 1
+        assert call_count[0] == 2  # retry consumed 2 budget slots
+
+    def test_retry_budget_exhaustion_fails_closed(self):
+        """max_requests=1 + transient failure → 1 call, then fail closed
+        (no retry when budget exhausted)."""
+        call_count = [0]
+        def counting_transport(url, body, headers):
+            call_count[0] += 1
+            raise TimeoutError("simulated timeout")
+
+        client = make_client(transport=counting_transport, max_retries=2)
+        config = CollectorConfig(
+            from_date="2026-08-05", to_date="2026-08-05",
+            max_requests=1,
+        )
+        collector = KospiCollector(client=client, config=config, request_delay=0.0)
+        with pytest.raises(KiwoomRateLimitError):
+            collector.collect_day("2026-08-05")
+        assert call_count[0] == 1  # budget exhausted before retry
+
+    def test_pagination_safety_guards_preserved(self):
+        """DEFAULT_MAX_PAGES guard still works alongside budget gate."""
+        # Empty next-key with cont_yn=Y should still raise PaginationError
+        pages = [make_minute_page([], cont_yn="Y", next_key="")]
+        client = make_client(transport=FakeTransport(responses=pages))
+        with pytest.raises(KiwoomPaginationError, match="empty"):
+            client.fetch_all("ka20005", "/api/dostk/chart", {})
+
+        # Repeated next-key should still raise PaginationError
+        pages = [
+            make_minute_page([], cont_yn="Y", next_key="k1"),
+            make_minute_page([], cont_yn="Y", next_key="k1"),
+        ]
+        client = make_client(transport=FakeTransport(responses=pages))
+        with pytest.raises(KiwoomPaginationError, match="repeated"):
+            client.fetch_all("ka20005", "/api/dostk/chart", {})
+
+    def test_metadata_requests_made_parity(self):
+        """metadata.requestsMade equals actual transport invocation count."""
+        # Single successful page
+        page = make_minute_page(
+            [minute_row("0900", 3200, 3210, 3190, 3205)],
+            cont_yn="N",
+        )
+        transport = FakeTransport(responses=[page])
+        client = make_client(transport=transport)
+        config = CollectorConfig(
+            from_date="2026-08-05", to_date="2026-08-05",
+            max_requests=10,
+        )
+        collector = KospiCollector(client=client, config=config, request_delay=0.0)
+        collector.collect_day("2026-08-05")
+        assert collector.requests_made == len(transport.calls)
+
+    def test_multi_day_cumulative_budget(self, monkeypatch, tmp_path):
+        """Budget is cumulative across days — day 1 uses budget too."""
+        import fmindex.market.kospi_collector as kc_mod
+        monkeypatch.setenv("KIWOOM_APPKEY", "app")
+        monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
+        monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
+        page = make_minute_page(
+            [minute_row("0900", 3200, 3210, 3190, 3205)],
+            cont_yn="N",
+        )
+        # Provide only 1 page total for both days
+        transport = FakeTransport(responses=[page])
+        client = make_client(transport=transport)
+        config = CollectorConfig(
+            from_date="2026-08-05", to_date="2026-08-06",
+            max_requests=1,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        collector = KospiCollector(client=client, config=config, request_delay=0.0)
+        # 2026-08-05 is a Wednesday (trading day), 2026-08-06 is Thursday (trading day)
+        # Budget=1 means only the first day's request succeeds; second day fails closed
+        with pytest.raises(KiwoomRateLimitError):
+            collector.collect_range("2026-08-05", "2026-08-06")
+        assert len(transport.calls) == 1  # only 1 transport call total
 
 
 # --------------------------------------------------------------------------- #

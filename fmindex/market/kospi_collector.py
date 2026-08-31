@@ -63,11 +63,13 @@ from .market_calendar import (
 from .kiwoom_auth import KiwoomAuthError, KiwoomTokenManager, credentials_available
 from .kiwoom_client import (
     API_CONTRACT_VERSION,
+    BudgetExhaustedError,
     KiwoomClient,
     KiwoomPaginationError,
     KiwoomRateLimitError,
     KiwoomAPIError,
     KiwoomResponse,
+    MutableBudgetGate,
 )
 
 #: Official endpoint paths (confirmed contract).
@@ -199,6 +201,12 @@ class KospiCollector:
         self.client = client or KiwoomClient()
         self.config = config
         self.request_delay = request_delay
+        # Shared hard budget gate — pagination and retry both consume from it.
+        if config is not None:
+            self._budget_gate = MutableBudgetGate(config.max_requests)
+            self.client.budget_gate = self._budget_gate
+        else:
+            self._budget_gate = None
         self.requests_made = 0
         self.records_received = 0
         self.records_accepted = 0
@@ -311,15 +319,17 @@ class KospiCollector:
         """
         if self.config and self.config.dry_run:
             return []
-        self._check_request_budget()
         body: Dict[str, Any] = {
             "mrkt_tp": KOSPI_MRKT_TP,
             "inds_cd": KOSPI_INDS_CD,
             "tic_scope": (self.config.tic_scope if self.config else "60"),
             "base_dt": date_str,
         }
-        pages = self.client.fetch_all(API_ID_MINUTE_CHART, SECTOR_PATH, body)
-        self.requests_made += len(pages)
+        try:
+            pages = self.client.fetch_all(API_ID_MINUTE_CHART, SECTOR_PATH, body)
+        except BudgetExhaustedError as exc:
+            raise KiwoomRateLimitError(str(exc)) from exc
+        self.requests_made = self.client.requests_made
         return pages
 
     def _parse_minute_pages(
@@ -618,6 +628,11 @@ class KospiCollector:
             raise KiwoomRateLimitError(
                 f"Max requests reached ({limit}). Stopping collection."
             )
+        if self._budget_gate is not None:
+            try:
+                self._budget_gate.consume()
+            except BudgetExhaustedError as exc:
+                raise KiwoomRateLimitError(str(exc)) from exc
 
     @staticmethod
     def _float(value: Any) -> Optional[float]:
