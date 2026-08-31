@@ -11,6 +11,7 @@ raw HTML are deliberately not stored in the normalized output.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from html.parser import HTMLParser
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
@@ -42,6 +43,42 @@ _DELETED_RE = re.compile(
 _ISO_DATETIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:?\d{2}|Z)?)?$",
 )
+
+
+def _validate_absolute_datetime(value: Optional[str]) -> Optional[str]:
+    """Validate and normalize an absolute datetime string.
+
+    Returns the value only if it is a valid, timezone-aware ISO 8601
+    datetime. Relative times, date-only strings, and malformed inputs
+    are rejected (return None).
+
+    Accepts:
+      - 2026-08-05T09:15:00+09:00
+      - 2026-08-05T00:15:00Z
+
+    Rejects:
+      - 3분 전, 방금, 어제, 오늘 (relative times)
+      - 2026-08-05 (date-only, no timezone)
+      - 2026-08-05T09:15 (time-only, no timezone)
+      - any malformed string
+    """
+    if not value or not str(value).strip():
+        return None
+    text = str(value).strip()
+    # Quick regex pre-check — rejects relative Korean text and date-only
+    if not _ISO_DATETIME_RE.match(text):
+        return None
+    # Normalize 'Z' suffix for fromisoformat compatibility
+    normalized = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+        # Ensure timezone awareness (no naive datetimes)
+        if dt.tzinfo is None:
+            return None
+        return text
+    except (ValueError, TypeError):
+        return None
+
 
 _TITLE_CLASSES = ("title", "np_18px", "b_title", "bd_title", "subject")
 _BODY_CLASSES = ("rd_body", "read_body", "bd_doc")
@@ -320,17 +357,12 @@ class _LiveHTMLParser(HTMLParser):
             if self.current is not None:
                 dt = getattr(self, "_published_dt", "") or ""
                 text = self._text()
-                # Only accept absolute ISO 8601 datetime. Reject relative
-                # times (방금, 분 전, 어제, etc.) and use them only for
-                # firstSeenAt provenance, never as publishedAt.
-                value = ""
-                if dt and dt.strip():
-                    value = dt.strip()
-                elif text and text.strip():
-                    # Validate that display text is an absolute datetime,
-                    # not a relative time string.
-                    if _ISO_DATETIME_RE.match(text.strip()):
-                        value = text.strip()
+                # Only accept absolute, timezone-aware ISO 8601 datetime.
+                # Reject relative times (방금, 분 전, 어제, etc.) and
+                # use them only for firstSeenAt provenance.
+                value = _validate_absolute_datetime(dt)
+                if value is None:
+                    value = _validate_absolute_datetime(text)
                 if value and self.current.publishedAt is None:
                     self.current.publishedAt = value
             self._capture = None
