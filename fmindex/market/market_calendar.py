@@ -41,7 +41,9 @@ CLOSING_AUCTION_MINUTE = 20
 CALENDAR_SOURCE = "krx-official-snapshot"
 
 #: Version of the holiday snapshot shipped in this module.
-CALENDAR_VERSION = "2026.1"
+#: Bumped when new KRX special closures (elections, year-end, etc.)
+#: are reconciled with the official calendar.
+CALENDAR_VERSION = "2026.2"
 
 #: Years this calendar snapshot supports. Ranges outside these years are
 #: rejected rather than guessed (no weekend-only heuristics).
@@ -72,6 +74,14 @@ PUBLIC_HOLIDAYS: set[Tuple[int, int, int]] = {
     (2026, 10, 5),   # 개천절 대체공휴일 (10/3 토요일)
     (2026, 10, 9),   # 한글날
     (2026, 12, 25),  # 성탄절
+    # --- KRX special market closures (not public holidays but KRX closes) ---
+    (2026, 5, 1),    # 근로자의 날 (KRX 시장 휴장)
+    (2026, 6, 1),    # 전국동시지방선거일 (KRX 선거휴장)
+    (2026, 6, 30),   # 학기말정산 휴장 (KRX 특별휴장)
+    (2026, 12, 28),  # 연말정산 전일 휴장
+    (2026, 12, 29),  # 연말정산 휴장
+    (2026, 12, 30),  # 연휴
+    (2026, 12, 31),  # 연말 최종 거래일 이후 휴장
 }
 
 
