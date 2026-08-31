@@ -1832,3 +1832,88 @@ class TestCalendarScope:
         assert is_trading_day(datetime(2026, 5, 25, 10, 0, tzinfo=KST)) is False  # 부처님오신날 Mon
         assert is_trading_day(datetime(2026, 10, 9, 10, 0, tzinfo=KST)) is False  # 한글날 Fri
         assert is_trading_day(datetime(2026, 10, 8, 10, 0, tzinfo=KST)) is True   # Thu before
+
+    def test_labor_day_closed(self):
+        """2026-05-01 (Workers' Day) is NOT a trading day."""
+        dt = datetime(2026, 5, 1, 10, 0, tzinfo=KST)
+        assert dt.weekday() == 4  # Friday
+        assert is_trading_day(dt) is False
+
+    def test_nationwide_election_day_closed(self):
+        """2026-06-01 (Local Election Day) is NOT a trading day."""
+        dt = datetime(2026, 6, 1, 10, 0, tzinfo=KST)
+        assert dt.weekday() == 0  # Monday
+        assert is_trading_day(dt) is False
+
+    def test_end_of_term_closure_closed(self):
+        """2026-06-30 (End-of-term special closure) is NOT a trading day."""
+        dt = datetime(2026, 6, 30, 10, 0, tzinfo=KST)
+        assert dt.weekday() == 1  # Tuesday
+        assert is_trading_day(dt) is False
+
+    def test_year_end_closure_closed(self):
+        """2026-12-28~31 are NOT trading days (year-end settlement)."""
+        for day in (28, 29, 30, 31):
+            dt = datetime(2026, 12, day, 10, 0, tzinfo=KST)
+            assert is_trading_day(dt) is False, f"2026-12-{day:02d} should be closed"
+
+    def test_year_end_closure_dow_check(self):
+        """Verify weekday positions for year-end closure dates."""
+        # 12/28 Mon, 12/29 Tue, 12/30 Wed, 12/31 Thu
+        assert datetime(2026, 12, 28, tzinfo=KST).weekday() == 0
+        assert datetime(2026, 12, 29, tzinfo=KST).weekday() == 1
+        assert datetime(2026, 12, 30, tzinfo=KST).weekday() == 2
+        assert datetime(2026, 12, 31, tzinfo=KST).weekday() == 3
+
+    def test_trading_day_request_plan_excludes_labor_day(self, monkeypatch, tmp_path):
+        """Labor Day must NOT appear in requestedDates for a valid plan."""
+        monkeypatch.setenv("KIWOOM_APPKEY", "app")
+        monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
+        monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
+        import fmindex.market.kospi_collector as kc_mod
+        config = CollectorConfig(
+            from_date="2026-04-27", to_date="2026-05-05", dry_run=True,
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        result = run_collector(config)
+        assert result.get("dryRun") is True
+        requested = result.get("requestedDates", [])
+        assert "2026-05-01" not in requested, "Labor Day must not be in request plan"
+
+    def test_holiday_only_range_returns_no_trading_days(self, monkeypatch, tmp_path):
+        """A range containing ONLY holidays returns NO_TRADING_DAYS."""
+        monkeypatch.setenv("KIWOOM_APPKEY", "app")
+        monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
+        monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
+        # 2026-12-28 to 2026-12-31: all year-end closures
+        config = CollectorConfig(
+            from_date="2026-12-28", to_date="2026-12-31",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        with pytest.raises(NoTradingDaysError, match="NO_TRADING_DAYS"):
+            run_collector(config)
+        assert not (tmp_path / "out.jsonl").exists()
+        assert not (tmp_path / "out.meta.json").exists()
+
+    def test_no_false_zero_record_failure_on_krx_closures(self, monkeypatch, tmp_path):
+        """Zero-record on a known KRX closure day must NOT raise; NO_TRADING_DAYS instead."""
+        monkeypatch.setenv("KIWOOM_APPKEY", "app")
+        monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
+        monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
+        # 2026-05-01 alone: Labor Day → NO_TRADING_DAYS, not zero-record failure
+        config = CollectorConfig(
+            from_date="2026-05-01", to_date="2026-05-01",
+            output=str(tmp_path / "out.jsonl"),
+            metadata_output=str(tmp_path / "out.meta.json"),
+        )
+        with pytest.raises(NoTradingDaysError, match="NO_TRADING_DAYS"):
+            run_collector(config)
+        assert not (tmp_path / "out.jsonl").exists()
+        assert not (tmp_path / "out.meta.json").exists()
+
+    def test_calendar_version_bumped(self):
+        """Calendar snapshot version must reflect the reconciliation."""
+        from fmindex.market.market_calendar import CALENDAR_VERSION
+        assert CALENDAR_VERSION == "2026.2"
