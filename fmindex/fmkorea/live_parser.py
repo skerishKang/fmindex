@@ -37,6 +37,12 @@ _DELETED_RE = re.compile(
     r"삭제된\s*(?:게시|글)|존재하지\s*않는\s*게시|글이\s*없|글을\s*찾을\s*수\s*없"
 )
 
+#: ISO 8601 datetime pattern for validated absolute published dates.
+#: Relative times (방금, 분 전, 어제, etc.) must never be accepted here.
+_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:?\d{2}|Z)?)?$",
+)
+
 _TITLE_CLASSES = ("title", "np_18px", "b_title", "bd_title", "subject")
 _BODY_CLASSES = ("rd_body", "read_body", "bd_doc")
 _COMMENT_LIST_CLASSES = ("comment", "cmt_item", "reply", "reply_list", "cmt_list", "comment_list", "fdb_itm")
@@ -314,11 +320,18 @@ class _LiveHTMLParser(HTMLParser):
             if self.current is not None:
                 dt = getattr(self, "_published_dt", "") or ""
                 text = self._text()
-                # Prefer the absolute datetime attribute; fall back to the
-                # display text only when it looks absolute. Relative times
-                # are never translated into absolute values.
-                value = dt or text
-                if self.current.publishedAt is None and value:
+                # Only accept absolute ISO 8601 datetime. Reject relative
+                # times (방금, 분 전, 어제, etc.) and use them only for
+                # firstSeenAt provenance, never as publishedAt.
+                value = ""
+                if dt and dt.strip():
+                    value = dt.strip()
+                elif text and text.strip():
+                    # Validate that display text is an absolute datetime,
+                    # not a relative time string.
+                    if _ISO_DATETIME_RE.match(text.strip()):
+                        value = text.strip()
+                if value and self.current.publishedAt is None:
                     self.current.publishedAt = value
             self._capture = None
             self._published_dt = ""
