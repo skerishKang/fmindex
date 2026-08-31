@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, 'fix/**']
+  pull_request:
+    branches: [main, master]
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: 1
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR head (exact SHA)
+        uses: actions/checkout@v4
+        with:
+          # For PRs, checkout the actual head SHA, not the synthetic merge ref.
+          # For pushes, checkout the pushed ref normally.
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          fetch-depth: 0
+
+      - name: Verify exact HEAD
+        run: |
+          EXPECTED="${{ github.event.pull_request.head.sha }}"
+          ACTUAL="$(git rev-parse HEAD)"
+          if [ -z "$EXPECTED" ]; then
+            echo "Not a PR event; skipping HEAD verification (push to branch)."
+          elif [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::Exact-head check failed: expected $EXPECTED, got $ACTUAL"
+            exit 1
+          else
+            echo "Exact-head verified: $ACTUAL"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: python -m pytest -q
+
+      - name: Compile all Python files
+        run: python -m compileall fmindex
+
+      - name: Build wheel
+        run: python -m build --wheel
+
+      - name: Wheel import smoke test
+        run: |
+          python -m pip install --target /tmp/fmindex_smoke dist/*.whl
+          python -c "import sys; sys.path.insert(0, '/tmp/fmindex_smoke'); import fmindex; print(f'fmindex {fmindex.__version__} imported OK')"
+
+      - name: Check diff for whitespace errors
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || '6a4cf26ecc5aa207d1415ec201bc322adc1d699b' }}"
+          git diff --check "$BASE"...HEAD

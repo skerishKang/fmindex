@@ -14,6 +14,6 @@
     "doctor": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/doctor.ps1",
     "check": "pnpm run doctor",
     "dev": "node -e \"console.log('Phase 0: no application runtime has been implemented yet.')\"",
-    "test": "node -e \"console.log('Phase 0: no automated test suite has been implemented yet.')\""
+    "test": "python -m pytest -q"
   }
 }

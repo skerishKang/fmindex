@@ -48,6 +48,42 @@ if ($pnpmVersion) {
     }
 }
 
+# Python checks
+$pythonVersion = Test-CommandVersion -Name 'python' -VersionCommand { python --version }
+if ($pythonVersion) {
+    Write-Host "  python: $pythonVersion"
+} else {
+    $failures.Add('Python is required but not found.')
+}
+
+# pytest readiness
+if ($pythonVersion) {
+    try {
+        $pytestCheck = python -c "import pytest; print(pytest.__version__)" 2>&1
+        if ($pytestCheck) {
+            Write-Host "  pytest: $pytestCheck"
+        } else {
+            $failures.Add('pytest is not installed. Run: pip install -e ".[dev]"')
+        }
+    } catch {
+        $failures.Add('pytest import check failed: ' + $_.Exception.Message)
+    }
+}
+
+# fmindex import readiness
+if ($pythonVersion) {
+    try {
+        $fmindexCheck = python -c "import fmindex; print(fmindex.__version__)" 2>&1
+        if ($fmindexCheck) {
+            Write-Host "  fmindex: v$fmindexCheck"
+        } else {
+            $failures.Add('fmindex import check failed.')
+        }
+    } catch {
+        $failures.Add('fmindex import check failed: ' + $_.Exception.Message)
+    }
+}
+
 if (-not (Test-Path '.git')) {
     $failures.Add('Current directory is not a Git checkout.')
 } else {

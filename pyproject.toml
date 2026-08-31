@@ -9,7 +9,7 @@ description = "FMIndex — 펨코지수 서비스 (키움 시장 데이터 + 펨
 requires-python = ">=3.8"
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "build"]
 
 [tool.setuptools.packages.find]
 include = ["fmindex*"]

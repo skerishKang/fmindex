@@ -97,10 +97,15 @@ def run_pipeline_once(
                 "source": str(bridge.data_root),
             })
         except FileNotFoundError as e:
+            # In auto mode, 65stock data root not found is a normal fallback
+            # condition — mark the step as "sample" so downstream code can
+            # proceed with generated sample data. Only kiwoom mode is strict.
             results["steps"].append({
                 "step": "market_bridge",
-                "status": "fail",
+                "status": "sample",
+                "records": 0,
                 "error": str(e),
+                "note": "65stock data root not available; sample data will be used",
             })
 
     # Fallback to sample data only in auto mode (never in kiwoom mode).
