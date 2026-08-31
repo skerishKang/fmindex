@@ -1842,10 +1842,10 @@ class TestCalendarScope:
     def test_election_day_closed(self):
         """2026-06-03 (9th Local Election Day) is NOT a trading day."""
         dt = datetime(2026, 6, 3, 10, 0, tzinfo=KST)
-        assert dt.weekday() == 2  # Tuesday
+        assert dt.weekday() == 2  # Wednesday
         assert is_trading_day(dt) is False
 
-    def test_hangugjeol_closed(self):
+    def test_constitution_day_closed(self):
         """2026-07-17 (Constitution Day) is NOT a trading day."""
         dt = datetime(2026, 7, 17, 10, 0, tzinfo=KST)
         assert dt.weekday() == 4  # Friday
@@ -1876,7 +1876,7 @@ class TestCalendarScope:
         assert datetime(2026, 12, 31, tzinfo=KST).weekday() == 3
 
     def test_request_plan_excludes_all_krx_closures(self, monkeypatch, tmp_path):
-        """Labor Day, Election Day, and Hangugjeol must NOT appear in requestedDates."""
+        """Labor Day, Election Day, and Constitution Day must NOT appear in requestedDates."""
         monkeypatch.setenv("KIWOOM_APPKEY", "app")
         monkeypatch.setenv("KIWOOM_SECRETKEY", "sec")
         monkeypatch.setenv("KIWOOM_65STOCK_ENV", "")
@@ -1890,7 +1890,7 @@ class TestCalendarScope:
         requested = result.get("requestedDates", [])
         assert "2026-05-01" not in requested, "Labor Day must not be in request plan"
         assert "2026-06-03" not in requested, "Election Day must not be in request plan"
-        assert "2026-07-17" not in requested, "Hangugjeol must not be in request plan"
+        assert "2026-07-17" not in requested, "Constitution Day must not be in request plan"
         # Verify that regular trading days are actually included
         assert "2026-06-30" in requested, "2026-06-30 should be a trading day in plan"
         assert "2026-07-16" in requested, "2026-07-16 should be a trading day in plan"
