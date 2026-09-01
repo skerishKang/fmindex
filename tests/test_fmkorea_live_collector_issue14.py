@@ -131,6 +131,51 @@ class TestCountersExactlyOnce:
         collector.fetch_posts(stubs, tmp_path)
         assert collector.deleted_posts == 2
 
+    def test_non_post_html_counter_incremented(self, tmp_path):
+        """HTTP 200 with non-post HTML increments unexpected_content exactly once."""
+        list_html = (
+            '<html><body>'
+            '<ul class="bd_lst"><li>'
+            '<a href="/123456780" class="title">Test Post</a>'
+            '</li></ul></body></html>'
+        )
+        non_post_html = "<html><body>login required</body></html>"
+        transport = FakeTransport([list_html, non_post_html])
+        collector = LiveFMKoreaCollector(transport=transport, max_list=1, max_posts=1)
+        posts = collector.fetch_list(tmp_path)
+        assert len(posts) == 1
+        collected = collector.fetch_posts(posts, tmp_path)
+        assert collected == []
+        assert collector.unexpected_content == 1
+        assert collector.deleted_posts == 0
+        assert len(transport.calls) == 2
+
+    def test_deleted_page_counter_incremented(self, tmp_path):
+        """HTTP 200 with deleted HTML increments deleted_posts exactly once."""
+        list_html = (
+            '<html><body>'
+            '<ul class="bd_lst"><li>'
+            '<a href="/123456780" class="title">Test Post</a>'
+            '</li></ul></body></html>'
+        )
+        deleted_html = (
+            '<html><body>'
+            '<h1 class="title">삭제된 게시물</h1>'
+            '<div class="bd_doc">이 게시물은 삭제되었거나 존재하지 않는 게시물입니다.</div>'
+            '</body></html>'
+        )
+        transport = FakeTransport([list_html, deleted_html])
+        collector = LiveFMKoreaCollector(transport=transport, max_list=1, max_posts=1)
+        posts = collector.fetch_list(tmp_path)
+        assert len(posts) == 1
+        collected = collector.fetch_posts(posts, tmp_path)
+        # Deleted post is returned in collected but marked deleted=True
+        assert len(collected) == 1
+        assert collected[0].deleted is True
+        assert collector.deleted_posts == 1
+        assert collector.unexpected_content == 0
+        assert len(transport.calls) == 2
+
 
 class TestSafetyBoundsFailFast:
     """Constructor must reject unsafe values with FMKoreaSafetyValidationError."""
@@ -382,3 +427,45 @@ class TestDatetimeValidation:
         assert post.publishedAt is None or post.publishedAt == ""
         assert post.firstSeenAt  # firstSeenAt should still be populated
         assert post.publishedAt != post.firstSeenAt
+
+
+class TestParseLivePostFailClosed:
+    """parse_live_post must return None for non-post HTML."""
+
+    def test_non_post_html_returns_none(self):
+        post = parse_live_post("<html><body>login required</body></html>", source_post_id="12345")
+        assert post is None
+
+    def test_empty_body_returns_none(self):
+        post = parse_live_post("<html><body></body></html>", source_post_id="12345")
+        assert post is None
+
+    def test_relative_time_only_returns_none(self):
+        post = parse_live_post("<html><body><time>3분 전</time></body></html>", source_post_id="12345")
+        assert post is None
+
+    def test_deleted_fixture_returns_post_with_deleted_true(self):
+        post = parse_live_post(read_fixture("live-deleted-sanitized.html"), source_post_id="123456780")
+        assert post is not None
+        assert post.deleted is True
+
+
+class TestDatetimeAttributeIntegration:
+    """Integration tests for datetime attribute handling in parser."""
+
+    def test_relative_datetime_attr_rejected(self):
+        html = '<time datetime="3분 전">3분 전</time>'
+        post = parse_live_post(html, source_post_id="12345")
+        assert post is None  # no title/body → non-post
+
+    def test_valid_datetime_attr_preferred_over_relative_text(self):
+        html = '<h1 class="title">Test Post</h1><time datetime="2026-08-05T09:15:00+09:00">3분 전</time>'
+        post = parse_live_post(html, source_post_id="12345")
+        assert post is not None
+        assert post.publishedAt == "2026-08-05T09:15:00+09:00"
+
+    def test_date_only_datetime_attr_rejected(self):
+        html = '<h1 class="title">Test</h1><time datetime="2026-08-05">2026-08-05</time>'
+        post = parse_live_post(html, source_post_id="12345")
+        assert post is not None
+        assert post.publishedAt is None

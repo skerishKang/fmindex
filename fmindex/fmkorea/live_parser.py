@@ -416,6 +416,14 @@ def parse_live_post(
     combined = normalize_text(f"{post.title} {post.body}")
     if _DELETED_RE.search(combined):
         post.deleted = True
+        post.compute_hash()
+        return post
+
+    # Fail closed: if no post-detail evidence (title, body, or comments),
+    # treat as non-post even when HTTP 200 was returned.
+    has_evidence = bool(post.title) or bool(post.body) or post.comments
+    if not has_evidence:
+        return None
 
     post.compute_hash()
     return post
