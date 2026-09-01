@@ -28,6 +28,8 @@ class JoinedRecord:
     postCount: int
     confidence: float
     data_mode: str
+    commentCount: int = 0
+    analyzedPostCount: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to the external camelCase JSON contract."""
@@ -43,6 +45,8 @@ class JoinedRecord:
             "postCount": self.postCount,
             "confidence": self.confidence,
             "dataMode": self.data_mode,
+            "commentCount": self.commentCount,
+            "analyzedPostCount": self.analyzedPostCount,
         }
 
 
@@ -99,16 +103,32 @@ class MarketSentimentJoiner:
             normalized = round((rec.close / base_close) * 100.0, 2)
 
             fm = fm_lookup.get(rec.timestamp)
-            if fm and fm.has_sentiment:
-                fm_index = fm.fmIndex
-                post_count = fm.postCount
-                confidence = fm.confidence
-                has_sentiment = True
-            else:
+            if fm is None:
+                # Case C: No FM bucket exists for this timestamp.
                 fm_index = None
                 post_count = 0
                 confidence = 0.0
                 has_sentiment = False
+                comment_count = 0
+                analyzed_post_count = 0
+            elif fm.has_sentiment:
+                # Case A: FM bucket exists and has analyzable sentiment.
+                fm_index = fm.fmIndex
+                post_count = fm.postCount
+                confidence = fm.confidence
+                has_sentiment = True
+                comment_count = fm.commentCount
+                analyzed_post_count = fm.analyzedPostCount
+            else:
+                # Case B: FM bucket exists but no analyzable sentiment.
+                # Preserve postCount (and metadata) — postCount=0 here means
+                # the bucket truly had zero posts, not that sentiment is missing.
+                fm_index = None
+                post_count = fm.postCount
+                confidence = 0.0
+                has_sentiment = False
+                comment_count = fm.commentCount
+                analyzed_post_count = fm.analyzedPostCount
 
             results.append(
                 JoinedRecord(
@@ -123,6 +143,8 @@ class MarketSentimentJoiner:
                     postCount=post_count,
                     confidence=confidence,
                     data_mode=rec.data_mode,
+                    commentCount=comment_count,
+                    analyzedPostCount=analyzed_post_count,
                 )
             )
 

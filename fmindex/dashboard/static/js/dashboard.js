@@ -215,6 +215,9 @@
   // 오늘의 해석 — 데이터에서 파생된 문장 (가짜 수치 아님)
   function interpretToday(latest, summary) {
     if (!latest || latest.fmIndex == null) {
+      if (latest && latest.postCount && latest.postCount > 0) {
+        return latest.postCount + '개의 게시글이 수집되었으나, 아직 심리 분석 결과가 없습니다. 분석이 완료되면 여기에 해석이 표시됩니다.';
+      }
       return '아직 심리 데이터가 없습니다. 파이프라인이 데이터를 생성하면 여기에 해석이 표시됩니다.';
     }
     var label = sentimentLabel(latest.fmIndex);

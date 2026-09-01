@@ -65,13 +65,21 @@ def sample_joined() -> list:
             "hasSentiment": False,
             "marketNormalized": 100.0,
             "marketChangeRate": 0.0,
-            "postCount": 0,
+            "postCount": 0,           # default 0 → no posts
             "confidence": 0.0,
             "dataMode": "sample",
+            "commentCount": 0,
+            "analyzedPostCount": 0,
         }
         if i == 1:
             row["fmIndex"] = 0.0          # real zero must be preserved
             row["hasSentiment"] = True
+        elif i == 2:
+            row["fmIndex"] = None          # no sentiment but posts present (Case B)
+            row["hasSentiment"] = False
+            row["postCount"] = 12
+            row["commentCount"] = 7
+            row["analyzedPostCount"] = 0
         elif i == 3:
             row["fmIndex"] = 65.5         # sentiment present
             row["hasSentiment"] = True
@@ -373,6 +381,34 @@ class TestZeroFmIndexUi:
 
     def test_sentiment_label_for_zero(self):
         assert js_json("ui.sentimentLabel(0)") == "강한 부정"
+
+
+class TestPostCountWithoutSentiment:
+    """postCount must be preserved (never zeroed) when hasSentiment is false."""
+
+    def test_postcount_preserved_in_buildchartdata(self):
+        joined = sample_joined()
+        built = js_json(f"ui.buildChartData({json.dumps(joined)}, 'all')")
+        # index 2 is the Case B row: fmIndex=null, postCount=12
+        assert built["source"][2]["postCount"] == 12
+        assert built["source"][2]["fmIndex"] is None
+        assert built["source"][2]["hasSentiment"] is False
+
+    def test_interpret_today_shows_postcount_when_no_sentiment(self):
+        """When fmIndex is null but postCount > 0, interpretation mentions posts."""
+        txt = js_json(
+            "ui.interpretToday({fmIndex:null, postCount:15, commentCount:7, analyzedPostCount:0, hasSentiment:false, confidence:0.0}, {totalAnalyzed:0, avgConfidence:0.0, dataMode:'sample'})"
+        )
+        assert "15" in txt
+        assert "게시글" in txt
+
+    def test_interpret_today_no_posts_message(self):
+        """When fmIndex is null and postCount is 0, no-posts message."""
+        txt = js_json(
+            "ui.interpretToday({fmIndex:null, postCount:0, commentCount:0, analyzedPostCount:0, hasSentiment:false, confidence:0.0}, {totalAnalyzed:0, avgConfidence:0.0, dataMode:'sample'})"
+        )
+        assert "없습니다" in txt
+        assert "15" not in txt
 
 
 # --------------------------------------------------------------------------- #
