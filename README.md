@@ -61,49 +61,51 @@ FMIndex MVP는 다음 질문에 답합니다.
 - **Derived-data product:** 장기 자산은 원문 복제본이 아니라 시간대별 파생지표와 검증 결과입니다.
 - **No silent failure:** 누락, 429, 파싱 실패, 모델 오류, 지수 표본 부족을 화면과 로그에 표시합니다.
 
-## 6. 예정 저장소 구조
+## 6. 저장소 구조
 
 ```text
 fmindex/
-├─ apps/
-│  ├─ collector/       # 목록·본문·댓글 증분 수집
-│  ├─ analyzer/        # 정제, 대상 인식, 감성·의도 분석
-│  ├─ api/             # 지수·상태 조회 API
-│  └─ web/             # 공개 대시보드 및 내부 운영화면
-├─ packages/
-│  ├─ contracts/       # 공통 스키마와 이벤트 계약
-│  ├─ taxonomy/        # 감정·행동 의도·표현 유형 분류체계
-│  └─ source-adapters/ # 데이터 원천별 어댑터
-├─ data/               # 로컬 데이터(기본 Git 제외)
-├─ docs/               # 제품·운영·데이터 정책·라벨링 문서
-└─ scripts/            # Windows 로컬 준비·진단 스크립트
+├─ docs/               # 제품·운영·데이터 정책·라벨링·계보 문서
+├─ fmindex/            # Python product package
+│  ├─ dashboard/       # 정적 대시보드와 localhost 서버
+│  ├─ fmkorea/         # FMKorea fixture/parser/live collector
+│  ├─ llm/             # LLM provider abstraction and mock provider
+│  ├─ market/          # 65stock bridge, Kiwoom client, KOSPI collector
+│  ├─ fmindex_calc.py  # 시간대별 sentiment index 계산
+│  ├─ market_join.py   # 시장 데이터와 FM index 결합
+│  └─ pipeline.py      # one-shot pipeline runner
+├─ scripts/            # Windows bootstrap/doctor scripts
+├─ tests/              # offline contract tests
+├─ package.json        # Node/pnpm command surface
+├─ pnpm-workspace.yaml
+└─ pyproject.toml
 ```
 
 ## 7. Windows 로컬 시작
 
-기본 작업 경로:
+현재 로컬 작업 경로:
 
 ```powershell
-G:\Ddrive\BatangD\task\workdiary\fmindex
+E:\fmindex260901
 ```
 
 새로 복제하는 경우:
 
 ```powershell
-cd G:\Ddrive\BatangD\task\workdiary
-git clone https://github.com/skerishKang/fmindex.git
-cd .\fmindex
+cd E:\
+git clone https://github.com/skerishKang/fmindex.git fmindex260901
+cd .\fmindex260901
 ```
 
 이미 폴더와 원격 저장소를 연결했다면:
 
 ```powershell
-cd G:\Ddrive\BatangD\task\workdiary\fmindex
+cd E:\fmindex260901
 git remote -v
 git pull origin main
 ```
 
-부트스트랩 문서 PR이 병합된 뒤에는 다음 명령을 사용합니다.
+통합 브랜치 또는 main 승격 후에는 다음 명령으로 준비와 검진을 실행합니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
@@ -112,7 +114,34 @@ powershell -ExecutionPolicy Bypass -File .\scripts\doctor.ps1
 
 권장 런타임 기준은 Node.js 24 LTS와 pnpm 11 계열입니다.
 
-## 8. 운영상 필수 기록
+## 8. 현재 구현 상태 (canonical main lineage)
+
+`fix/16-canonical-main-lineage` 브랜치는 검증된 모든 product 구현과 #11~#15 정합성 수정을 하나의 canonical 선으로 통합한 브랜치입니다. 향후 `main` 승격 시 기초가 됩니다.
+
+### 구현 완료
+
+| 영역 | 구현 내용 |
+|------|-----------|
+| Python package | `fmindex` 패키지 (`fmindex_calc`, `market_join`, `pipeline`, `dashboard`, `fmkorea`, `market`, `llm`) |
+| Dashboard UI | Chart.js 기반 정적 대시보드 (light/dark 테마, 코스피·나스닥 전환, 기간 필터) |
+| KOSPI collector | Kiwoom/65stock 시간당 OHLC 수집, 개별 종목 reject, 하드 요청 예산 |
+| FMKorea live collector | 저빈도 수집, 하드 안전 경계 (`request_delay >= 3.0`, `max_posts <= 3`) |
+| Exact-head CI | GitHub Actions 정합성 검증 + `git diff --check` 게이트 |
+| postCount semantics | FM bucket이 없으면 `postCount=0`, sentiment 없어도 `postCount` 보존 |
+
+### 보류 / 비목표
+
+- 투자 자문·매매 추천 (MVP 범위 외)
+- 공격적 대량 크롤링 (low-frequency only)
+- auth bypass / CAPTCHA bypass
+- real LLM provider productionization (MockLLMProvider 사용)
+- NASDAQ 실시간 데이터 피드 (샘플 데이터 사용)
+
+### 저장소 체계
+
+통합된 변경사항은 `docs/REPOSITORY_LINEAGE.md`에서 확인할 수 있습니다.
+
+## 9. 운영상 필수 기록
 
 모든 수집·분석 실행은 최소 다음 정보를 기록해야 합니다.
 
@@ -124,7 +153,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\doctor.ps1
 - 지수 산식 버전과 유효 표본 수
 - 원문 보존 만료 시각
 
-## 9. 데이터·법적 원칙
+## 10. 데이터·법적 원칙
 
 - 공개 접근 가능 여부와 별개로 사이트 정책, 저작권, 데이터베이스 권리, 개인정보 문제를 검토합니다.
 - 접근 제한 우회, 인증 우회, CAPTCHA 우회, 과도한 병렬 요청을 구현하지 않습니다.
@@ -132,9 +161,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\doctor.ps1
 - 원문은 분석·검증 목적의 제한된 기간만 보관하고 장기적으로 파생 데이터와 해시를 중심으로 보존합니다.
 - 외부 공개 전에는 출처별 수집 범위와 이용 조건을 다시 검토합니다.
 
-## 10. 문서
+## 11. 문서
 
-부트스트랩 PR에서 다음 문서가 추가됩니다.
+현재 주요 문서는 다음과 같습니다.
 
 - `docs/PRODUCT.md` — 제품 범위와 성공 기준
 - `docs/ARCHITECTURE.md` — 시스템 경계와 데이터 흐름
@@ -143,8 +172,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\doctor.ps1
 - `docs/LABELING_GUIDE.md` — 사람 라벨링 기준
 - `docs/LOCAL_SETUP.md` — Windows 로컬 설치 절차
 - `docs/ROADMAP.md` — Phase 0부터 공개 MVP까지의 단계
+- `docs/REPOSITORY_LINEAGE.md` — stacked PR 정리와 canonical main 승격 계보
 
-## 11. 현재 승인 기준
+## 12. 현재 승인 기준
 
 Phase 0는 다음 조건을 충족해야 종료합니다.
 
@@ -155,6 +185,6 @@ Phase 0는 다음 조건을 충족해야 종료합니다.
 - 원문 보존·삭제 정책이 구현 가능한 수준으로 정의됐다.
 - 라벨링 대상과 분석 스키마가 확정됐다.
 
-## 12. 면책
+## 13. 면책
 
 FMIndex는 시장심리 연구·정보 제공 프로젝트입니다. 지수와 분석 결과는 투자 권유, 투자자문, 매매 신호 또는 수익 보장을 의미하지 않습니다.

@@ -1,0 +1,66 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Output directory (pipeline results, not committed)
+output/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local data: never commit raw or derived runtime datasets by default
+data/raw/
+data/normalized/
+data/aggregates/
+data/exports/
+data/checkpoints/
+data/quarantine/
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite3
+
+# Logs and runtime state
+logs/
+run/
+*.log
+*.pid
+
+# Build and test outputs
+dist/
+build/
+coverage/
+.cache/
+.turbo/
+.next/
+playwright-report/
+test-results/
+
+# Model files
+models/
+*.gguf
+*.safetensors
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
+# Build artifacts
+*.egg-info/

@@ -1,0 +1,5 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Raw data, local databases, exports, and model files are not workspace packages.

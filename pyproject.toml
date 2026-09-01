@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fmindex"
+version = "0.1.0"
+description = "FMIndex — 펨코지수 서비스 (키움 시장 데이터 + 펨코 심리분석 + Chart.js 대시보드)"
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+dev = ["pytest", "build"]
+
+[tool.setuptools.packages.find]
+include = ["fmindex*"]
+
+[tool.setuptools.package-data]
+"fmindex.dashboard" = [
+  "templates/*.html",
+  "static/css/*.css",
+  "static/js/*.js",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
