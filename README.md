@@ -84,31 +84,61 @@ fmindex/
 기본 작업 경로:
 
 ```powershell
-G:\Ddrive\BatangD\task\workdiary\fmindex
+E:\fmindex260901
 ```
 
 새로 복제하는 경우:
 
 ```powershell
-cd G:\Ddrive\BatangD\task\workdiary
+cd E:\fmindex260901
 git clone https://github.com/skerishKang/fmindex.git
-cd .\fmindex
 ```
 
 이미 폴더와 원격 저장소를 연결했다면:
 
 ```powershell
-cd G:\Ddrive\BatangD\task\workdiary\fmindex
+cd E:\fmindex260901
 git remote -v
 git pull origin main
 ```
 
-부트스트랩 문서 PR이 병합된 뒤에는 다음 명령을 사용합니다.
+부트스트랩 스크립트는 이미 머지되었습니다. 다음 명령으로 준비와 검진을 실행합니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\doctor.ps1
 ```
+
+권장 �untime 기준은 Node.js 24 LTS와 pnpm 11 계열입니다.
+
+## 8. 현재 구현 상태 (canonical main lineage)
+
+`fix/16-canonical-main-lineage` 브랜치는 검증된 모든 product 구현과
+#11~#15 정합성 수정을 하나의 canonical 선으로 통합한 브랜치입니다.
+향후 `main` 승격 시 기초가 됩니다.
+
+### 구현 완료
+
+| 영역 | 구현 내용 |
+|------|-----------|
+| Python package | `fmindex` 패키지 (`fmindex_calc`, `market_join`, `pipeline`, `dashboard`, `fmkorea`, `market`, `llm`) |
+| Dashboard UI | Chart.js 기반 정적 대시보드 (light/dark 테마, 코스피·나스닥 전환, 기간 필터) |
+| KOSPI collector | Kiwoom/65stock 시간당 OHLC 수집, 개별 종목 reject, 하드 요청 예산 |
+| FMKorea live collector | 저빈도 수집, 하드 안전 경계 (request_delay ≥ 3.0, max_posts ≤ 3) |
+| Exact-head CI | GitHub Actions 정합성 검증 + `git diff --check` 게이트 |
+| postCount semantics | FM bucket이 없으면 postCount=0, sentiment 없어도 postCount 보존 |
+
+### 보류 / 비목표
+
+- 투자 자문·매매 추천 (MVP 범위 외)
+- 공격적 대량 크롤링 (low-frequency only)
+- auth bypass / CAPTCHA bypass
+- real LLM provider productionization (MockLLMProvider 사용)
+- NASDAQ 실시간 데이터 피드 (샘플 데이터 사용)
+
+### 저장소 체계
+
+통합된 변경사항은 `docs/REPOSITORY_LINEAGE.md`에서 확인할 수 있습니다.
 
 권장 런타임 기준은 Node.js 24 LTS와 pnpm 11 계열입니다.
 
